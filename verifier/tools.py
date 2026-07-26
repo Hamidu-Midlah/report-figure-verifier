@@ -28,6 +28,14 @@ def _excel_cell_ref(sheet: str, row: int, col: int) -> str:
     return f"'{sheet.replace(chr(39), chr(39) * 2)}'!{a1}"
 
 
+def sanitize(text):
+    """Replace em dashes in text with safe punctuation (this project bans them)."""
+    if not isinstance(text, str):
+        return text
+    em = chr(8212)  # em dash (U+2014), built from its code point to keep this file clean
+    return text.replace(f" {em} ", ": ").replace(em, "-")
+
+
 # ---------------------------------------------------------------------------
 # Spreadsheet access
 # ---------------------------------------------------------------------------
@@ -37,9 +45,34 @@ class SourceWorkbook:
 
     def __init__(self, path: str):
         self._wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        # Per-run evidence registry so findings can cite a validated result by id
+        # instead of the model re-typing (and sometimes dropping) a cell ref.
+        self._match_counter = 0
+        self._matches: dict[str, dict] = {}   # match_id -> {"sheet", "cell"}
+        self._cell_sheet: dict[str, str] = {}  # cell ref -> sheet name
 
     def list_sheets(self) -> list[str]:
         return self._wb.sheetnames
+
+    def _register_match(self, sheet: str, cell: str) -> str:
+        self._match_counter += 1
+        match_id = f"match_{self._match_counter:04d}"
+        self._matches[match_id] = {"sheet": sheet, "cell": cell}
+        self._cell_sheet[cell] = sheet
+        return match_id
+
+    def resolve_match(self, match_id: str):
+        """Return {'sheet','cell'} for a match_id issued this run, else None."""
+        return self._matches.get(match_id)
+
+    def is_known_cell(self, cell: str) -> bool:
+        return cell in self._cell_sheet
+
+    def sheet_for_cell(self, cell: str) -> str:
+        return self._cell_sheet.get(cell, "")
+
+    def is_known_sheet(self, sheet: str) -> bool:
+        return sheet in set(self._wb.sheetnames)
 
     def read_sheet(self, sheet_name: str, max_rows: int = 200) -> list[list]:
         """Return the sheet as a list of rows (truncated for context safety)."""
@@ -56,14 +89,14 @@ class SourceWorkbook:
     def find_value(self, query: str) -> list[dict]:
         """Search all sheets for cells whose text matches `query` (case-insensitive).
 
-        Returns each match with its exact Excel `cell` reference (A1 notation,
-        sheet-qualified, e.g. Sales!D3), its row context, AND the sheet's header
-        row, so the agent can cite the precise cell and align a number to the
-        right column/period (e.g. map a value to the "2026" column) instead of
-        guessing by position.
+        Each match carries a `match_id` (a stable, tool-issued identifier for
+        that exact result this run), the `sheet`, the exact Excel `cell`
+        reference (A1 notation, sheet-qualified, e.g. Sales!D3), its row context,
+        and the sheet's header row. Findings cite the `match_id`, so the sheet
+        and cell are resolved deterministically rather than parsed from prose.
         """
         query_l = query.lower()
-        hits = []
+        raw = []
         for name in self._wb.sheetnames:
             ws = self._wb[name]
             header_row = None
@@ -73,16 +106,22 @@ class SourceWorkbook:
                     header_row = cells
                 for c_idx, cell in enumerate(row, start=1):
                     if cell is not None and query_l in str(cell).lower():
-                        hits.append({
-                            "sheet": name,
-                            "row": r_idx,
-                            "col": c_idx,
-                            "cell": _excel_cell_ref(name, r_idx, c_idx),
-                            "cell_value": str(cell),
-                            "header_row": header_row,
-                            "row_context": cells,
-                        })
-        return hits[:20]  # cap to keep tool results bounded
+                        raw.append((name, r_idx, c_idx, str(cell), header_row, cells))
+
+        hits = []
+        for name, r_idx, c_idx, cell_value, header_row, cells in raw[:20]:
+            cell_ref = _excel_cell_ref(name, r_idx, c_idx)
+            hits.append({
+                "match_id": self._register_match(name, cell_ref),
+                "sheet": name,
+                "row": r_idx,
+                "col": c_idx,
+                "cell": cell_ref,
+                "cell_value": cell_value,
+                "header_row": header_row,
+                "row_context": cells,
+            })
+        return hits  # capped to 20 results above
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +227,96 @@ def compare_values(reported, source, tolerance: float = 0.0) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Source evidence and display helpers (deterministic, no free-text parsing
+# during normal operation)
+# ---------------------------------------------------------------------------
+
+# Legacy fallback only: recover "X sheet" from a human-readable source_location
+# when a finding predates structured evidence.
+_SHEET_TEXT_RE = re.compile(r"([A-Za-z0-9'’ _-]+?)\s+sheet\b", re.IGNORECASE)
+
+# A leading sheet-qualified A1 reference, e.g. "Sales!D3" or "'Regional Sales'!D3".
+_LEADING_CELL = re.compile(r"^\s*(?:'[^']+'|[A-Za-z0-9_]+)![A-Z]{1,3}\d+\s*;?\s*")
+
+# Scale units the spreadsheet may imply (k / m / bn ...).
+_VALUE_UNIT = re.compile(r"\d\s*(k|m|bn|billion|million|thousand)\b", re.IGNORECASE)
+_CONTEXT_UNIT = re.compile(r"\b(k|m|bn|billion|million|thousand)\b", re.IGNORECASE)
+_PLAIN_NUMBER = re.compile(r"^[\d,]*\.?\d+$")
+
+
+def _parse_sheet_text(location: str) -> str:
+    m = _SHEET_TEXT_RE.search(location or "")
+    return m.group(1).strip() if m else ""
+
+
+def resolve_source_sheet(finding: dict):
+    """Deterministically resolve (sheet, source_mapping_status) for a finding.
+
+    Structured `sheet` wins. Only when it is absent (a legacy finding) do we
+    fall back to parsing "X sheet" from the human-readable source_location.
+    """
+    if finding.get("verdict") == "unverifiable":
+        return "", "n/a"
+    sheet = (finding.get("sheet") or "").strip()
+    if sheet:
+        return sheet, "structured"
+    parsed = _parse_sheet_text(finding.get("source_location", ""))
+    if parsed:
+        return parsed, "fallback"
+    return "", "under_specified"
+
+
+def sheets_referenced(findings) -> list:
+    """Unique source sheets cited by verifiable findings, counted once each."""
+    sheets = set()
+    for f in findings:
+        sheet, _status = resolve_source_sheet(f)
+        if sheet:
+            sheets.add(sheet)
+    return sorted(sheets)
+
+
+def with_cell_prefix(cell: str, location: str) -> str:
+    """Prepend the authoritative cell to source_location, never duplicating it."""
+    location = (location or "").strip()
+    if not cell:
+        return location
+    if location.startswith(cell):
+        return location
+    stripped = _LEADING_CELL.sub("", location).strip()
+    return f"{cell}; {stripped}" if stripped else cell
+
+
+def _unit_of(value) -> str:
+    m = _VALUE_UNIT.search(str(value or ""))
+    return m.group(1).lower() if m else ""
+
+
+def display_source_value(finding: dict) -> str:
+    """Source value for display, preserving an implied scale unit (k/m/bn)."""
+    src = str(finding.get("source_value", "")).strip()
+    if _unit_of(src):
+        return src
+    unit = _unit_of(finding.get("reported_value", ""))
+    if not unit:
+        m = _CONTEXT_UNIT.search(finding.get("source_location", "") or "")
+        unit = m.group(1).lower() if m else ""
+    if unit and _PLAIN_NUMBER.match(src):
+        return f"{src}{unit}"
+    return src
+
+
+def mismatch_line(finding: dict) -> str:
+    """A concise, deterministic one-liner for a mismatch banner entry."""
+    loc = (finding.get("source_location") or "").strip()
+    prefix = f"{loc}: " if loc else ""
+    return sanitize(
+        f"{prefix}report says {finding.get('reported_value', '')}; "
+        f"spreadsheet says {display_source_value(finding)}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Findings log: the agent's structured output channel
 # ---------------------------------------------------------------------------
 
@@ -200,6 +329,9 @@ class Finding:
     source_location: str
     verdict: str          # match | rounding_diff | mismatch | unverifiable
     note: str = ""
+    sheet: str = ""       # resolved worksheet name (empty for unverifiable)
+    cell: str = ""        # resolved A1 cell reference (empty for unverifiable)
+    source_mapping_status: str = ""  # structured | fallback | under_specified | n/a
 
 
 @dataclass

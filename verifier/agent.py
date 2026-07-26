@@ -14,7 +14,14 @@ import os
 
 import anthropic
 
-from .tools import SourceWorkbook, extract_numeric_claims, compare_values, FindingsLog
+from .tools import (
+    SourceWorkbook,
+    extract_numeric_claims,
+    compare_values,
+    FindingsLog,
+    with_cell_prefix,
+    resolve_source_sheet,
+)
 
 MODEL = os.environ.get("VERIFIER_MODEL", "claude-sonnet-4-6")
 MAX_TURNS = 40
@@ -27,11 +34,12 @@ Your task: verify every numeric claim in the report against the spreadsheet.
 Rules you must follow:
 1. NEVER rely on your own memory or arithmetic. Every source value must come \
 from a spreadsheet tool call, and every comparison must use compare_values.
-2. For each numeric claim, either (a) verify it and log a finding whose \
-source_location cites the exact spreadsheet cell, or (b) log it as \
-'unverifiable' with a note explaining why (e.g. the figure comes from an \
-external citation, not the source data). For unverifiable claims, set \
-source_location to exactly "Not present in spreadsheet".
+2. For each numeric claim, either (a) verify it and log a finding that includes \
+source_match_id (the match_id copied verbatim from the exact find_in_spreadsheet \
+result you used), or (b) log it as 'unverifiable' with a note explaining why \
+(e.g. the figure comes from an external citation, not the source data). For \
+unverifiable claims, set source_location to exactly "Not present in \
+spreadsheet" and leave source_match_id, sheet, and cell empty.
 3. Match the claim to the RIGHT cell, not merely to any cell that happens to \
 hold the same number. When a claim names a period (an explicit year such as \
 "in 2026", or a relative term like "now", "current", or "today"), read the \
@@ -39,11 +47,11 @@ header row to find the matching column and compare against THAT column's \
 value. A relative term with no explicit year refers to the most recent period \
 in the data (the latest column). Double-check that the value you compared \
 truly sits in that cell before logging.
-4. For every spreadsheet-backed finding, source_location MUST begin with the \
-exact Excel cell reference from the tool's `cell` field (A1 notation, \
-sheet-qualified, e.g. Sales!D3), followed by the human-readable sheet name, \
-row label, and column/period. For example: \
-"Sales!D3; Sales sheet, row 3 (Manchester GBP k), 2026 column".
+4. source_location is a human-readable explanation only: give the sheet name, \
+row label, and column/period, for example \
+"Sales sheet, row 3 (Manchester GBP k), 2026 column". You need not prepend the \
+cell reference yourself; it is added automatically from source_match_id. Never \
+invent a match_id: copy it verbatim from a find_in_spreadsheet result.
 5. Use tolerance=0.5 by default for percentages that appear rounded to whole \
 numbers; use tolerance=0 for exact counts. State the tolerance you used in \
 the note when it matters.
@@ -65,10 +73,11 @@ TOOL_SCHEMAS = [
         "name": "find_in_spreadsheet",
         "description": (
             "Search all sheets for cells containing the query text "
-            "(case-insensitive). Returns matches with the exact Excel `cell` "
-            "reference (A1 notation, sheet-qualified, e.g. Sales!D3), the sheet, "
-            "row, the full row context, and the sheet's header_row so you can "
-            "cite the precise cell and align each number to the correct "
+            "(case-insensitive). Each match includes a `match_id` (copy it "
+            "verbatim into log_finding as source_match_id), the `sheet`, the "
+            "exact Excel `cell` reference (A1 notation, sheet-qualified, e.g. "
+            "Sales!D3), the row, the full row context, and the sheet's "
+            "header_row, so you can align each number to the correct "
             "column/period (e.g. the '2026' column) instead of guessing by "
             "position."
         ),
@@ -100,7 +109,10 @@ TOOL_SCHEMAS = [
         "name": "log_finding",
         "description": (
             "Record one verified (or unverifiable) claim in the findings log. "
-            "Call this exactly once per claim."
+            "Call this exactly once per claim. For spreadsheet-backed findings, "
+            "pass source_match_id (the match_id from the exact find_in_spreadsheet "
+            "result you used); the sheet and cell are resolved from it. Leave "
+            "source_match_id, sheet, and cell empty for unverifiable claims."
         ),
         "input_schema": {
             "type": "object",
@@ -114,6 +126,12 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "enum": ["match", "rounding_diff", "mismatch", "unverifiable"],
                 },
+                "source_match_id": {
+                    "type": "string",
+                    "description": "match_id copied verbatim from find_in_spreadsheet.",
+                },
+                "sheet": {"type": "string"},
+                "cell": {"type": "string"},
                 "note": {"type": "string"},
             },
             "required": ["claim_id", "sentence", "reported_value",
@@ -199,15 +217,57 @@ def _dispatch(name: str, args: dict, workbook: SourceWorkbook,
                 float(args.get("tolerance", 0.0)),
             )
         if name == "log_finding":
-            return log.add(
-                claim_id=args["claim_id"],
-                sentence=args["sentence"],
-                reported_value=args["reported_value"],
-                source_value=args["source_value"],
-                source_location=args["source_location"],
-                verdict=args["verdict"],
-                note=args.get("note", ""),
-            )
+            return _apply_log_finding(args, workbook, log)
         return {"error": f"Unknown tool: {name}"}
     except Exception as exc:  # surface tool errors to the model, don't crash
         return {"error": str(exc)}
+
+
+def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
+    """Resolve source evidence deterministically, then record the finding.
+
+    Sheet and cell come from the tool-issued source_match_id (validated against
+    this run's results), never from model-typed prose. source_location is kept
+    for human explanation only, with the authoritative cell prepended.
+    """
+    verdict = args["verdict"]
+    source_location = args.get("source_location", "")
+    sheet = cell = ""
+
+    if verdict != "unverifiable":
+        match_id = (args.get("source_match_id") or "").strip()
+        if match_id:
+            resolved = workbook.resolve_match(match_id)
+            if resolved is None:
+                return {"error": (
+                    f"Unknown source_match_id '{match_id}'. Copy match_id exactly "
+                    "from a find_in_spreadsheet result returned in this run."
+                )}
+            sheet, cell = resolved["sheet"], resolved["cell"]
+        else:
+            # Fallback: accept a model-supplied cell/sheet only if it was actually
+            # returned by find_in_spreadsheet during this run.
+            m_cell = (args.get("cell") or "").strip()
+            m_sheet = (args.get("sheet") or "").strip()
+            if m_cell and workbook.is_known_cell(m_cell):
+                cell, sheet = m_cell, workbook.sheet_for_cell(m_cell)
+            elif m_sheet and workbook.is_known_sheet(m_sheet):
+                sheet = m_sheet
+        source_location = with_cell_prefix(cell, source_location)
+
+    status = resolve_source_sheet(
+        {"verdict": verdict, "sheet": sheet, "source_location": source_location}
+    )[1]
+
+    return log.add(
+        claim_id=args["claim_id"],
+        sentence=args["sentence"],
+        reported_value=args["reported_value"],
+        source_value=args["source_value"],
+        source_location=source_location,
+        verdict=verdict,
+        note=args.get("note", ""),
+        sheet=sheet,
+        cell=cell,
+        source_mapping_status=status,
+    )

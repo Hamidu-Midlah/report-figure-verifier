@@ -5,7 +5,6 @@ Requires ANTHROPIC_API_KEY in the environment.
 """
 
 import os
-import re
 import uuid
 import tempfile
 from datetime import datetime, timezone
@@ -14,6 +13,12 @@ import pandas as pd
 import streamlit as st
 
 from verifier.agent import run_verification, MODEL
+from verifier.tools import (
+    sanitize,
+    resolve_source_sheet,
+    sheets_referenced,
+    mismatch_line,
+)
 
 st.set_page_config(page_title="FigureAudit", page_icon="✅", layout="wide")
 
@@ -31,7 +36,7 @@ with st.expander("How it works"):
         "3. All comparisons are computed in Python with an explicit rounding "
         "tolerance, never by the model.\n"
         "4. Every claim gets a verdict: match, rounding difference, mismatch, or "
-        "unverifiable, each with the exact sheet, cell, and row checked.\n"
+        "unverifiable, each tied to the exact worksheet and cell checked.\n"
         "5. A human reviews the findings; nothing is auto-corrected."
     )
 
@@ -40,6 +45,14 @@ VERDICT_ICONS = {
     "rounding_diff": "🟡 rounding diff",
     "mismatch": "🔴 mismatch",
     "unverifiable": "⚪ unverifiable",
+}
+
+STATUS_ICONS = {
+    "structured": "✓ structured",
+    "fallback": "~ fallback",
+    "under_specified": "⚠ under-specified",
+    "n/a": "",
+    "": "",
 }
 
 # Default tolerances the agent is instructed to use (surfaced in run info).
@@ -70,21 +83,10 @@ _REPORT_SECTIONS = [
     ("match", "Verified matches"),
 ]
 
-# Leading sheet-qualified cell reference, e.g. Adoption!D2 or 'Regional Sales'!D3.
-_SHEET_REF = re.compile(r"^\s*(?:'([^']+)'|([A-Za-z0-9_]+))!")
-
-
-def _sanitize(text):
-    """Replace em dashes in model-generated text with safe punctuation."""
-    if not isinstance(text, str):
-        return text
-    em = chr(8212)  # em dash (U+2014), built from its code point to keep this file clean
-    return text.replace(f" {em} ", ": ").replace(em, "-")
-
 
 def _clean_finding(f: dict) -> dict:
     """Sanitise every string field of a finding for display and export."""
-    return {k: _sanitize(v) for k, v in f.items()}
+    return {k: sanitize(v) for k, v in f.items()}
 
 
 def _num(value):
@@ -126,40 +128,10 @@ def _narrative_sentence(f) -> str:
     return f'✅ "{claim}" matches the source data ({loc}).'
 
 
-def _sheet_of(location: str):
-    """Extract the sheet name from a leading A1 cell reference, or None."""
-    m = _SHEET_REF.match(location or "")
-    if not m:
-        return None
-    return m.group(1) or m.group(2)
-
-
-def _sheets_referenced(findings) -> list:
-    """Unique spreadsheet sheets cited by verifiable findings (never unverifiable)."""
-    sheets = []
-    for f in findings:
-        if f["verdict"] == "unverifiable":
-            continue
-        sheet = _sheet_of(f.get("source_location", ""))
-        if sheet:
-            sheets.append(sheet)
-    return sorted(set(sheets))
-
-
-def _mismatch_line(f) -> str:
-    """A concise, deterministic one-liner for a mismatch banner entry."""
-    loc = f.get("source_location", "").strip()
-    prefix = f"{loc}: " if loc else ""
-    return _sanitize(
-        f"{prefix}report says {f['reported_value']}; "
-        f"spreadsheet says {f['source_value']}."
-    )
-
-
 def _run_info_lines(run: dict) -> list:
     """Ordered run-metadata lines shared by the expander and the reports."""
     findings = run["findings"]
-    sheets = _sheets_referenced(findings)
+    sheets = sheets_referenced(findings)
     return [
         f"- Run ID: {run['run_id']}",
         f"- Timestamp: {run['timestamp']}",
@@ -204,7 +176,7 @@ def build_markdown_report(body_findings, run: dict) -> str:
     if not any_shown:
         lines += ["_No findings in this view._", ""]
 
-    return _sanitize("\n".join(lines).rstrip() + "\n")
+    return sanitize("\n".join(lines).rstrip() + "\n")
 
 
 col1, col2 = st.columns(2)
@@ -248,7 +220,7 @@ if st.button("Run verification", type="primary"):
     status.update(label="Verification complete", state="complete", expanded=False)
 
     findings = [_clean_finding(f) for f in result.get("findings", [])]
-    summary_text = _sanitize(next(
+    summary_text = sanitize(next(
         (entry["text"] for entry in result.get("transcript", [])
          if isinstance(entry, dict) and entry.get("role") == "assistant"
          and "text" in entry),
@@ -280,7 +252,7 @@ if run:
     rounding = [f for f in findings if f["verdict"] == "rounding_diff"]
     unverifiable = [f for f in findings if f["verdict"] == "unverifiable"]
     verifiable = [f for f in findings if f["verdict"] != "unverifiable"]
-    sheets = _sheets_referenced(findings)
+    sheets = sheets_referenced(findings)
     coverage = f"{len(findings)} claims checked across {len(sheets)} source sheets."
 
     # ---- Results banner --------------------------------------------------
@@ -289,7 +261,7 @@ if run:
         st.error(f"{n} issue requires review" if n == 1
                  else f"{n} issues require review")
         for f in mismatches:
-            st.markdown("- " + _mismatch_line(f))
+            st.markdown("- " + mismatch_line(f))
     elif rounding or unverifiable:
         parts = []
         if rounding:
@@ -338,10 +310,24 @@ if run:
     view = [f for f in findings if f["verdict"] in allowed]
     st.caption(f"Showing {len(view)} of {len(findings)} findings.")
 
+    under_specified = [
+        f for f in view if resolve_source_sheet(f)[1] == "under_specified"
+    ]
+
     if view:
         df = pd.DataFrame(view)
         df["verdict"] = df["verdict"].map(lambda v: VERDICT_ICONS.get(v, v))
+        if "source_mapping_status" in df.columns:
+            df["source_mapping_status"] = df["source_mapping_status"].map(
+                lambda s: STATUS_ICONS.get(s, s)
+            )
         st.dataframe(df, use_container_width=True, hide_index=True)
+        if under_specified:
+            st.warning(
+                f"{len(under_specified)} finding"
+                + ("" if len(under_specified) == 1 else "s")
+                + " could not be mapped to a source cell (under-specified)."
+            )
     else:
         st.info(_EMPTY_MESSAGES[choice])
 
