@@ -141,3 +141,6 @@ Python · Anthropic API (native tool use) · openpyxl · Streamlit · pandas
 - Fuzzy label matching for spreadsheet search
 - Batch mode over a folder of chapters
 - LangGraph port (same tools, graph-based orchestration) for comparison
+- Interactive follow-up queries over a completed run (re-check a claim against a
+  different sheet, adjust tolerance, search cells), using the same grounded
+  toolset.
