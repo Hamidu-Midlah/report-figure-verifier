@@ -1,4 +1,4 @@
-# Report Figure Verification Agent
+# FigureAudit
 
 An LLM agent that verifies every numeric claim in a draft report against its
 source-of-truth spreadsheet, and refuses to trust its own memory or
@@ -137,10 +137,12 @@ Python · Anthropic API (native tool use) · openpyxl · Streamlit · pandas
 
 ## Roadmap
 
-- `.docx`/PDF report ingestion
-- Fuzzy label matching for spreadsheet search
-- Batch mode over a folder of chapters
-- LangGraph port (same tools, graph-based orchestration) for comparison
-- Interactive follow-up queries over a completed run (re-check a claim against a
-  different sheet, adjust tolerance, search cells), using the same grounded
-  toolset.
+- Reviewer decisions and comments
+- Per-claim recheck with adjustable tolerance
+- XLSX review-workbook export
+- DOCX and PDF ingestion
+- Numeric normalisation for units, currencies, k/m/bn abbreviations, percentages,
+  and percentage points
+- Claim classification
+- Source-mapping confidence levels
+- Multi-workbook support

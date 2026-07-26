@@ -11,6 +11,21 @@ import re
 from dataclasses import dataclass, field, asdict
 
 import openpyxl
+from openpyxl.utils import get_column_letter
+
+
+def _excel_cell_ref(sheet: str, row: int, col: int) -> str:
+    """Return a sheet-qualified A1 reference, e.g. Sales!D3 or 'Regional Sales'!D3.
+
+    Sheet names that contain anything other than letters, digits, or underscores
+    are wrapped in single quotes (with any internal quote doubled), matching how
+    Excel itself qualifies such references.
+    """
+    a1 = f"{get_column_letter(col)}{row}"
+    sheet = sheet or ""
+    if re.fullmatch(r"[A-Za-z0-9_]+", sheet):
+        return f"{sheet}!{a1}"
+    return f"'{sheet.replace(chr(39), chr(39) * 2)}'!{a1}"
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +56,11 @@ class SourceWorkbook:
     def find_value(self, query: str) -> list[dict]:
         """Search all sheets for cells whose text matches `query` (case-insensitive).
 
-        Returns the matching cell plus its row context AND the sheet's header
-        row, so the agent can align a number to the right column/period (e.g.
-        map a value to the "2026" column) instead of guessing by position.
+        Returns each match with its exact Excel `cell` reference (A1 notation,
+        sheet-qualified, e.g. Sales!D3), its row context, AND the sheet's header
+        row, so the agent can cite the precise cell and align a number to the
+        right column/period (e.g. map a value to the "2026" column) instead of
+        guessing by position.
         """
         query_l = query.lower()
         hits = []
@@ -60,6 +77,7 @@ class SourceWorkbook:
                             "sheet": name,
                             "row": r_idx,
                             "col": c_idx,
+                            "cell": _excel_cell_ref(name, r_idx, c_idx),
                             "cell_value": str(cell),
                             "header_row": header_row,
                             "row_context": cells,

@@ -27,23 +27,30 @@ Your task: verify every numeric claim in the report against the spreadsheet.
 Rules you must follow:
 1. NEVER rely on your own memory or arithmetic. Every source value must come \
 from a spreadsheet tool call, and every comparison must use compare_values.
-2. For each numeric claim, either (a) verify it and log a finding with the \
-exact source location (sheet + row), or (b) log it as 'unverifiable' with a \
-note explaining why (e.g. the figure comes from an external citation, not the \
-source data).
+2. For each numeric claim, either (a) verify it and log a finding whose \
+source_location cites the exact spreadsheet cell, or (b) log it as \
+'unverifiable' with a note explaining why (e.g. the figure comes from an \
+external citation, not the source data). For unverifiable claims, set \
+source_location to exactly "Not present in spreadsheet".
 3. Match the claim to the RIGHT cell, not merely to any cell that happens to \
 hold the same number. When a claim names a period (an explicit year such as \
 "in 2026", or a relative term like "now", "current", or "today"), read the \
 header row to find the matching column and compare against THAT column's \
 value. A relative term with no explicit year refers to the most recent period \
-in the data (the latest column). Record the exact column/period you used in \
-source_location, and double-check that the value you compared truly sits in \
-that column before logging.
-4. Use tolerance=0.5 by default for percentages that appear rounded to whole \
+in the data (the latest column). Double-check that the value you compared \
+truly sits in that cell before logging.
+4. For every spreadsheet-backed finding, source_location MUST begin with the \
+exact Excel cell reference from the tool's `cell` field (A1 notation, \
+sheet-qualified, e.g. Sales!D3), followed by the human-readable sheet name, \
+row label, and column/period. For example: \
+"Sales!D3; Sales sheet, row 3 (Manchester GBP k), 2026 column".
+5. Use tolerance=0.5 by default for percentages that appear rounded to whole \
 numbers; use tolerance=0 for exact counts. State the tolerance you used in \
 the note when it matters.
-5. Do not editorialise about the report's arguments. You verify numbers only.
-6. When all claims are processed, reply with a short plain-text summary. Do \
+6. Do not editorialise about the report's arguments. You verify numbers only.
+7. Never use em dash characters in any text you write (source_location, notes, \
+or your final summary). Use a colon, semicolon, comma, or hyphen instead.
+8. When all claims are processed, reply with a short plain-text summary. Do \
 not restate every finding; they are already in the log.
 
 Work through claims systematically. Batch related lookups where possible."""
@@ -58,10 +65,12 @@ TOOL_SCHEMAS = [
         "name": "find_in_spreadsheet",
         "description": (
             "Search all sheets for cells containing the query text "
-            "(case-insensitive). Returns matches with sheet, row, the full "
-            "row context, and the sheet's header_row so you can align each "
-            "number to the correct column/period (e.g. the '2026' column) "
-            "instead of guessing by position."
+            "(case-insensitive). Returns matches with the exact Excel `cell` "
+            "reference (A1 notation, sheet-qualified, e.g. Sales!D3), the sheet, "
+            "row, the full row context, and the sheet's header_row so you can "
+            "cite the precise cell and align each number to the correct "
+            "column/period (e.g. the '2026' column) instead of guessing by "
+            "position."
         ),
         "input_schema": {
             "type": "object",
