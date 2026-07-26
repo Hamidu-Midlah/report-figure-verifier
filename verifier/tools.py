@@ -127,7 +127,7 @@ def extract_numeric_claims(report_text: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Comparison — done in Python, never by the model
+# Comparison: done in Python, never by the model
 # ---------------------------------------------------------------------------
 
 def _to_float(value) -> float | None:
@@ -170,7 +170,7 @@ def compare_values(reported, source, tolerance: float = 0.0) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Findings log — the agent's structured output channel
+# Findings log: the agent's structured output channel
 # ---------------------------------------------------------------------------
 
 @dataclass

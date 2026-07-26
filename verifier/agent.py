@@ -32,8 +32,8 @@ exact source location (sheet + row), or (b) log it as 'unverifiable' with a \
 note explaining why (e.g. the figure comes from an external citation, not the \
 source data).
 3. Match the claim to the RIGHT cell, not merely to any cell that happens to \
-hold the same number. When a claim names a period — an explicit year (e.g. \
-"in 2026"), or a relative term like "now", "current", or "today" — read the \
+hold the same number. When a claim names a period (an explicit year such as \
+"in 2026", or a relative term like "now", "current", or "today"), read the \
 header row to find the matching column and compare against THAT column's \
 value. A relative term with no explicit year refers to the most recent period \
 in the data (the latest column). Record the exact column/period you used in \
@@ -44,7 +44,7 @@ numbers; use tolerance=0 for exact counts. State the tolerance you used in \
 the note when it matters.
 5. Do not editorialise about the report's arguments. You verify numbers only.
 6. When all claims are processed, reply with a short plain-text summary. Do \
-not restate every finding — they are already in the log.
+not restate every finding; they are already in the log.
 
 Work through claims systematically. Batch related lookups where possible."""
 
@@ -74,7 +74,7 @@ TOOL_SCHEMAS = [
         "description": (
             "Compare a reported figure with a source figure numerically. "
             "Returns a verdict: match, rounding_diff, mismatch, or "
-            "not_comparable. All comparison arithmetic happens here — never "
+            "not_comparable. All comparison arithmetic happens here, never "
             "compare numbers yourself."
         ),
         "input_schema": {

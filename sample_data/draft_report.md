@@ -1,4 +1,4 @@
-# AI Adoption in Financial Services — Draft Chapter (Demo)
+# AI Adoption in Financial Services: Draft Chapter (Demo)
 
 In 2026, 36% of surveyed firms report scaling AI across their organisation,
 up from 32% in 2024. Combined adoption (scaling plus piloting) now stands at
