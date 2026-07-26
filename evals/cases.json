@@ -1,0 +1,16 @@
+{
+  "description": "Expected verdicts when running the agent on sample_data/draft_report.md against sample_data/source_data.xlsx. Keys are substrings that identify the claim sentence; values are the expected verdict for the figure named.",
+  "cases": [
+    {"id": "E01", "sentence_contains": "36% of surveyed firms report scaling", "figure": "36%", "expected_verdict": "mismatch", "why": "Source says 39 for 2026; 36 is the 2025 value"},
+    {"id": "E02", "sentence_contains": "up from 32% in 2024", "figure": "32%", "expected_verdict": "match", "why": "Source 2024 scaling = 32"},
+    {"id": "E03", "sentence_contains": "Combined adoption", "figure": "60%", "expected_verdict": "mismatch", "why": "Source combined 2026 = 63"},
+    {"id": "E04", "sentence_contains": "piloting AI has declined to 24%", "figure": "24%", "expected_verdict": "match", "why": "Source piloting 2026 = 24"},
+    {"id": "E05", "sentence_contains": "Only 6% of firms expect no change", "figure": "6%", "expected_verdict": "match", "why": "Source no-change 2026 = 6"},
+    {"id": "E06", "sentence_contains": "less mature markets account for 38%", "figure": "38%", "expected_verdict": "mismatch", "why": "Source less-mature share = 27 — a major discrepancy"},
+    {"id": "E07", "sentence_contains": "more mature markets account for 73%", "figure": "73%", "expected_verdict": "match", "why": "Source more-mature share = 73"},
+    {"id": "E08", "sentence_contains": "North America leads with USD 4.2", "figure": "4.2", "expected_verdict": "match", "why": "Source NA investment = 4.2"},
+    {"id": "E09", "sentence_contains": "Asia-Pacific at USD 3.1", "figure": "3.1", "expected_verdict": "match", "why": "Source APAC = 3.1"},
+    {"id": "E10", "sentence_contains": "Europe at USD 2.8", "figure": "2.8", "expected_verdict": "match", "why": "Source Europe = 2.8"},
+    {"id": "E11", "sentence_contains": "USD 200 billion by 2028", "figure": "200", "expected_verdict": "unverifiable", "why": "External consultancy estimate — not in source data"}
+  ]
+}
