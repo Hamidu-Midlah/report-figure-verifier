@@ -23,7 +23,11 @@ from verifier.tools import (
 st.set_page_config(page_title="FigureAudit", page_icon="✅", layout="wide")
 
 st.title("FigureAudit")
-st.caption("Verify every number in your report against its source spreadsheet.")
+st.subheader("Evidence-grounded report verification")
+st.write(
+    "FigureAudit verifies numerical claims in reports against their exact "
+    "source spreadsheet cells before publication."
+)
 st.markdown(
     "Python-verified comparisons · Exact source locations · Human review required"
 )
@@ -179,6 +183,131 @@ def build_markdown_report(body_findings, run: dict) -> str:
     return sanitize("\n".join(lines).rstrip() + "\n")
 
 
+def render_results(run_state: dict) -> None:
+    """Render the completed-run UI. Call exactly once per Streamlit execution.
+
+    Reads only from `run_state` (session state), so filter and download reruns
+    re-render the same single set of controls without re-running verification.
+    """
+    findings = run_state["findings"]
+    summary_text = run_state["summary_text"]
+
+    mismatches = [f for f in findings if f["verdict"] == "mismatch"]
+    rounding = [f for f in findings if f["verdict"] == "rounding_diff"]
+    unverifiable = [f for f in findings if f["verdict"] == "unverifiable"]
+    verifiable = [f for f in findings if f["verdict"] != "unverifiable"]
+    sheets = sheets_referenced(findings)
+    coverage = f"{len(findings)} claims checked across {len(sheets)} source sheets."
+
+    # ---- Results banner --------------------------------------------------
+    if mismatches:
+        n = len(mismatches)
+        st.error(f"{n} issue requires review" if n == 1
+                 else f"{n} issues require review")
+        for f in mismatches:
+            st.markdown("- " + mismatch_line(f))
+    elif rounding or unverifiable:
+        parts = []
+        if rounding:
+            parts.append(f"{len(rounding)} rounding difference"
+                         + ("" if len(rounding) == 1 else "s"))
+        if unverifiable:
+            parts.append(f"{len(unverifiable)} unverifiable claim"
+                         + ("" if len(unverifiable) == 1 else "s"))
+        total = len(rounding) + len(unverifiable)
+        verb = "item requires" if total == 1 else "items require"
+        st.warning(f"{total} {verb} human review ({', '.join(parts)}).")
+    else:
+        st.success(
+            f"No issues found: all {len(verifiable)} verifiable claims "
+            "match the source data."
+        )
+    st.caption(coverage)
+
+    # ---- Summary metrics -------------------------------------------------
+    counts = run_state.get("summary_counts", {})
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Matches", counts.get("match", 0))
+    m2.metric("Rounding diffs", counts.get("rounding_diff", 0))
+    m3.metric("Mismatches", counts.get("mismatch", 0))
+    m4.metric("Unverifiable", counts.get("unverifiable", 0))
+
+    # ---- Agent summary (prose) -------------------------------------------
+    if summary_text:
+        st.subheader("Summary")
+        st.write(summary_text)
+
+    # ---- Run information -------------------------------------------------
+    with st.expander("Run information"):
+        st.markdown("\n".join(_run_info_lines(run_state)))
+
+    # ---- What was checked ------------------------------------------------
+    with st.expander("Report under review"):
+        st.markdown(run_state["report_text"])
+
+    # ---- Findings table + filter -----------------------------------------
+    st.subheader("Findings (human review required)")
+    choice = st.radio(
+        "Filter findings", list(_FILTERS.keys()), horizontal=True, index=0
+    )
+    allowed = _FILTERS[choice]
+    view = [f for f in findings if f["verdict"] in allowed]
+    st.caption(f"Showing {len(view)} of {len(findings)} findings.")
+
+    under_specified = [
+        f for f in view if resolve_source_sheet(f)[1] == "under_specified"
+    ]
+
+    if view:
+        df = pd.DataFrame(view)
+        df["verdict"] = df["verdict"].map(lambda v: VERDICT_ICONS.get(v, v))
+        if "source_mapping_status" in df.columns:
+            df["source_mapping_status"] = df["source_mapping_status"].map(
+                lambda s: STATUS_ICONS.get(s, s)
+            )
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        if under_specified:
+            st.warning(
+                f"{len(under_specified)} finding"
+                + ("" if len(under_specified) == 1 else "s")
+                + " could not be mapped to a source cell (under-specified)."
+            )
+    else:
+        st.info(_EMPTY_MESSAGES[choice])
+
+    # ---- Downloads -------------------------------------------------------
+    rid = run_state["run_id"]
+    md_current = build_markdown_report(view, run_state)
+    md_full = build_markdown_report(findings, run_state)
+    csv_current = pd.DataFrame(view).to_csv(index=False) if view else ""
+    csv_full = pd.DataFrame(findings).to_csv(index=False)
+
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        st.download_button(
+            "Download current view (.md)", md_current,
+            file_name=f"figureaudit_{rid}_view.md", disabled=not view,
+        )
+    with d2:
+        st.download_button(
+            "Download full report (.md)", md_full,
+            file_name=f"figureaudit_{rid}_full.md",
+        )
+    with d3:
+        st.download_button(
+            "Download current view (.csv)", csv_current,
+            file_name=f"figureaudit_{rid}_view.csv", disabled=not view,
+        )
+    with d4:
+        st.download_button(
+            "Download full findings (.csv)", csv_full,
+            file_name=f"figureaudit_{rid}_full.csv",
+        )
+
+    with st.expander("Agent transcript (for audit)"):
+        st.json(run_state["transcript"])
+
+
 col1, col2 = st.columns(2)
 with col1:
     report_file = st.file_uploader("Draft report (.md / .txt)", type=["md", "txt"])
@@ -242,123 +371,9 @@ if st.button("Run verification", type="primary"):
         "transcript": result.get("transcript", []),
     }
 
-# ---- Render the most recent completed run (survives filter/download reruns) ----
-run = st.session_state.get("run")
-if run:
-    findings = run["findings"]
-    summary_text = run["summary_text"]
-
-    mismatches = [f for f in findings if f["verdict"] == "mismatch"]
-    rounding = [f for f in findings if f["verdict"] == "rounding_diff"]
-    unverifiable = [f for f in findings if f["verdict"] == "unverifiable"]
-    verifiable = [f for f in findings if f["verdict"] != "unverifiable"]
-    sheets = sheets_referenced(findings)
-    coverage = f"{len(findings)} claims checked across {len(sheets)} source sheets."
-
-    # ---- Results banner --------------------------------------------------
-    if mismatches:
-        n = len(mismatches)
-        st.error(f"{n} issue requires review" if n == 1
-                 else f"{n} issues require review")
-        for f in mismatches:
-            st.markdown("- " + mismatch_line(f))
-    elif rounding or unverifiable:
-        parts = []
-        if rounding:
-            parts.append(f"{len(rounding)} rounding difference"
-                         + ("" if len(rounding) == 1 else "s"))
-        if unverifiable:
-            parts.append(f"{len(unverifiable)} unverifiable claim"
-                         + ("" if len(unverifiable) == 1 else "s"))
-        total = len(rounding) + len(unverifiable)
-        verb = "item requires" if total == 1 else "items require"
-        st.warning(f"{total} {verb} human review ({', '.join(parts)}).")
-    else:
-        st.success(
-            f"No issues found: all {len(verifiable)} verifiable claims "
-            "match the source data."
-        )
-    st.caption(coverage)
-
-    # ---- Summary metrics -------------------------------------------------
-    counts = run.get("summary_counts", {})
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Matches", counts.get("match", 0))
-    m2.metric("Rounding diffs", counts.get("rounding_diff", 0))
-    m3.metric("Mismatches", counts.get("mismatch", 0))
-    m4.metric("Unverifiable", counts.get("unverifiable", 0))
-
-    # ---- Agent summary (prose) -------------------------------------------
-    if summary_text:
-        st.subheader("Summary")
-        st.write(summary_text)
-
-    # ---- Run information -------------------------------------------------
-    with st.expander("Run information"):
-        st.markdown("\n".join(_run_info_lines(run)))
-
-    # ---- What was checked ------------------------------------------------
-    with st.expander("Report under review"):
-        st.markdown(run["report_text"])
-
-    # ---- Findings table + filter -----------------------------------------
-    st.subheader("Findings (human review required)")
-    choice = st.radio(
-        "Filter findings", list(_FILTERS.keys()), horizontal=True, index=0
-    )
-    allowed = _FILTERS[choice]
-    view = [f for f in findings if f["verdict"] in allowed]
-    st.caption(f"Showing {len(view)} of {len(findings)} findings.")
-
-    under_specified = [
-        f for f in view if resolve_source_sheet(f)[1] == "under_specified"
-    ]
-
-    if view:
-        df = pd.DataFrame(view)
-        df["verdict"] = df["verdict"].map(lambda v: VERDICT_ICONS.get(v, v))
-        if "source_mapping_status" in df.columns:
-            df["source_mapping_status"] = df["source_mapping_status"].map(
-                lambda s: STATUS_ICONS.get(s, s)
-            )
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        if under_specified:
-            st.warning(
-                f"{len(under_specified)} finding"
-                + ("" if len(under_specified) == 1 else "s")
-                + " could not be mapped to a source cell (under-specified)."
-            )
-    else:
-        st.info(_EMPTY_MESSAGES[choice])
-
-    # ---- Downloads -------------------------------------------------------
-    rid = run["run_id"]
-    md_current = build_markdown_report(view, run)
-    md_full = build_markdown_report(findings, run)
-    csv_current = pd.DataFrame(view).to_csv(index=False) if view else ""
-    csv_full = pd.DataFrame(findings).to_csv(index=False)
-
-    d1, d2, d3, d4 = st.columns(4)
-    with d1:
-        st.download_button(
-            "Download current view (.md)", md_current,
-            file_name=f"figureaudit_{rid}_view.md", disabled=not view,
-        )
-    with d2:
-        st.download_button(
-            "Download full report (.md)", md_full,
-            file_name=f"figureaudit_{rid}_full.md",
-        )
-    with d3:
-        st.download_button(
-            "Download current view (.csv)", csv_current,
-            file_name=f"figureaudit_{rid}_view.csv", disabled=not view,
-        )
-    with d4:
-        st.download_button(
-            "Download full findings (.csv)", csv_full,
-            file_name=f"figureaudit_{rid}_full.csv",
-        )
-
-    with st.expander("Agent transcript (for audit)"):
-        st.json(run["transcript"])
+# ---- Render the most recent completed run exactly once -----------------------
+# The run action above only writes session state; all results rendering happens
+# here, in a single call, so filter/download reruns never duplicate the output.
+run_state = st.session_state.get("run")
+if run_state:
+    render_results(run_state)
