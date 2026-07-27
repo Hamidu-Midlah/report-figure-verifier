@@ -59,6 +59,33 @@ Key design decisions:
 - **One structured output channel.** Findings go through `log_finding` with an
   enum verdict, not free text, so downstream review is a table, not prose.
 
+## Design evolution
+
+FigureAudit reached its current design through three stages, each removing a
+place where the system trusted the model's prose instead of a validated fact.
+
+Early builds derived structured facts, such as the count of source sheets a
+report drew on, by parsing the agent's free-text description of where each
+number came from. A production run exposed how brittle that is: when the
+model's explanation left out the expected cell reference, the parser silently
+reported zero source sheets even though the findings themselves were sound.
+
+The fix introduced structured match evidence. Rather than reading meaning out
+of prose, the spreadsheet search tool issues an identifier for each result, and
+findings cite that identifier; the sheet is then resolved in Python from a
+per-run registry. Sheet attribution became reliable because it no longer
+depended on how the model happened to phrase its explanation.
+
+The final step extends the same idea to the exact number compared. Selecting a
+source value, comparing it, and logging a finding each carry a tool-issued
+identifier, forming a full evidence chain from the matched row, to the exact
+numeric cell, to the comparison, to the finding. Every verdict now traces back
+to the precise cell that produced it, and the human-readable location is kept
+for explanation only, never as the source of truth.
+
+The principle, stated plainly: never trust explanatory prose where a
+structured, validated reference can be used.
+
 ## Evals
 
 `python -m evals.run_evals` runs the agent end-to-end on the sample data and
