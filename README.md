@@ -124,12 +124,116 @@ for explanation only, never as the source of truth.
 The principle, stated plainly: never trust explanatory prose where a
 structured, validated reference can be used.
 
+## Engine and CLI
+
+The verification engine is independent of Streamlit. One public entry point owns
+report ingestion, numeric-claim extraction, spreadsheet loading, tool
+orchestration, exact source-cell selection, Python comparisons, evidence-chain
+validation, completeness checking, structured findings, and run metadata. It
+holds no UI state and does no presentation.
+
+From Python:
+
+```python
+from verifier.engine import verify_report
+
+run = verify_report("report.docx", "source.xlsx")
+print(run.status)          # "completed" or "incomplete"
+result = run.to_dict()     # versioned JSON schema, as a dict
+```
+
+For in-memory uploads (used by the Streamlit app), a byte adapter shares the
+same engine, so there is no second verification path:
+
+```python
+from verifier.engine import verify_report_from_bytes
+
+run = verify_report_from_bytes(report_bytes, "report.pdf",
+                               workbook_bytes, "source.xlsx")
+```
+
+From the command line:
+
+```bash
+python -m verifier.cli \
+  --report report.docx \
+  --workbook source.xlsx \
+  --output result.json        # omit --output to write JSON to stdout
+
+python -m verifier.cli --schema-version   # prints 1.0
+python -m verifier.cli --help
+```
+
+JSON goes to the output file, or to stdout when no output path is given. All
+progress, warnings, and diagnostics go to stderr, so stdout stays valid JSON.
+The API key is read from `ANTHROPIC_API_KEY` and is never a command-line
+argument; `--model` configures the model without exposing the key.
+
+`--include-transcript` adds the full model and tool-call transcript to the JSON
+as supplementary audit evidence. It is excluded by default (`transcript_included`
+is `false`). The transcript may contain report text and spreadsheet values, so
+treat it as potentially confidential; secrets (API keys, tokens, authorization
+headers) are always redacted before serialisation. The structured findings
+remain authoritative.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Completed successfully |
+| 1 | Internal failure |
+| 2 | Invalid input or usage |
+| 3 | Ingestion failure |
+| 4 | Authentication failure |
+| 5 | Incomplete or truncated verification |
+
+The process exits `0` only when every extracted claim is logged exactly once,
+every verifiable finding carries its full evidence chain
+(`match_id` to `source_value_id` to `comparison_id` to finding) with the compared
+cell matching the selected source cell, and the run did not reach its turn limit.
+
+### JSON schema (version 1.0)
+
+Top level: `schema_version`, `run_id`, `status`, `timestamp`, `model`, `input`,
+`ingestion`, `settings`, `extracted_claim_count`, `completed_finding_count`,
+`verdict_counts`, `source_sheets_referenced`, `findings`, `completion`, `errors`,
+`tool_call_count`, `agent_turn_count`, `transcript_included` (and `transcript`
+only when requested).
+
+Each verifiable finding carries `claim_id`, `sentence`, `reported_value`,
+`source_value`, `verdict`, `difference`, `tolerance`, `sheet`, `label_cell`,
+`source_cell`, `match_id`, `source_value_id`, `comparison_id`, `source_location`,
+`source_mapping_status`, and `note`. Unverifiable findings carry no spreadsheet
+evidence identifiers. Secrets and API keys are never present in the default
+output.
+
+## Architecture boundary and future frontend
+
+The current frontend is Streamlit, and it remains Streamlit. `app.py` is a thin
+presentation layer that calls the same `verifier.engine` entry point the CLI
+uses; there is no separate verification path, and no business logic is
+duplicated in the UI. The `verifier` package owns everything from ingestion to
+structured findings and knows nothing about Streamlit, session state, uploaded
+widgets, or download buttons.
+
+This boundary keeps a future React frontend and shared production API a small
+step rather than a rewrite: a thin HTTP service would call the same
+`verify_report` engine and return the same versioned JSON. React and Go are not
+implemented and are not part of this project today.
+
+Migration trigger: a full platform frontend and account system should be built
+only after real usage demonstrates the need for persistent runs, reviewer
+accounts, collaboration, or organisational deployment.
+
 ## Evals
 
-`python -m evals.run_evals` runs the agent end-to-end on the sample data and
-scores it against 11 expected verdicts (matches, three seeded mismatches, and
-an unverifiable external claim). The harness exits non-zero on any failure, so
-it is CI-ready.
+`python -m evals.run_evals` runs the sample data end-to-end through the public
+CLI (`python -m verifier.cli`), parses its JSON output, and scores it against 11
+expected verdicts (matches, three seeded mismatches, and an unverifiable
+external claim). Beyond verdicts, the harness asserts schema version 1.0, that
+all 11 claims are logged exactly once, that every verifiable finding has its
+exact source-value cell, and that the CLI exited 0 on complete success. It exits
+non-zero on any failure, so it is CI-ready.
 
 Real run (`claude-sonnet-4-6`, all cases passing):
 

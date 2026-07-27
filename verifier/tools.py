@@ -87,6 +87,7 @@ class SourceWorkbook:
         source_value_id = f"srcval_{self._srcval_counter:04d}"
         self._source_values[source_value_id] = {
             "source_value_id": source_value_id,
+            "match_id": match_id,
             "sheet": match["sheet"],
             "cell": cell,
             "value": info["value"],
@@ -115,6 +116,10 @@ class SourceWorkbook:
     def resolve_comparison(self, comparison_id: str):
         """Return the registered comparison record, else None."""
         return self._comparisons.get(comparison_id)
+
+    def comparison_records(self) -> dict:
+        """A copy of every comparison this run recorded, for evidence auditing."""
+        return {cid: dict(rec) for cid, rec in self._comparisons.items()}
 
     def read_sheet(self, sheet_name: str, max_rows: int = 200) -> list[list]:
         """Return the sheet as a list of rows (truncated for context safety)."""
@@ -441,8 +446,11 @@ class Finding:
     sheet: str = ""         # resolved worksheet name (empty for unverifiable)
     source_cell: str = ""   # exact numeric value cell, e.g. Adoption!D2
     label_cell: str = ""    # row-label cell used to find the row, e.g. Adoption!A2
+    match_id: str = ""         # evidence chain: find_in_spreadsheet id (empty if unverifiable)
     source_value_id: str = ""  # evidence chain: select_source_cell id (empty if unverifiable)
     comparison_id: str = ""    # evidence chain: compare_values id (empty if unverifiable)
+    difference: float | None = None  # |reported - source| from the comparison
+    tolerance: float | None = None   # tolerance used in the comparison
     source_mapping_status: str = ""  # structured | fallback | under_specified | n/a
 
 

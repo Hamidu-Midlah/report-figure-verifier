@@ -1,34 +1,47 @@
-"""Eval harness: run the agent on the sample data and score it.
+"""Eval harness: run the sample data through the verifier CLI and score it.
 
 Usage:  python -m evals.run_evals
-Requires ANTHROPIC_API_KEY. Prints a pass/fail table and exits non-zero if
-any case fails, so this can run in CI.
+Requires ANTHROPIC_API_KEY. Invokes the public CLI end to end, parses its JSON
+output, scores the 11 expected verdicts, and enforces the completeness gates.
+Exits non-zero unless every gate passes, so this is a CI-ready regression check.
 """
 
 import json
+import subprocess
 import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from verifier.agent import run_verification  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
     cases = json.loads((ROOT / "evals" / "cases.json").read_text())["cases"]
-    report_text = (ROOT / "sample_data" / "draft_report.md").read_text()
-    xlsx = str(ROOT / "sample_data" / "source_data.xlsx")
+    report = ROOT / "sample_data" / "draft_report.md"
+    xlsx = ROOT / "sample_data" / "source_data.xlsx"
 
-    print(f"Running agent on sample data ({len(cases)} eval cases)…\n")
-    result = run_verification(report_text, xlsx)
-    findings = result["findings"]
+    print(f"Running the verifier CLI on sample data ({len(cases)} eval cases)...",
+          file=sys.stderr)
+    proc = subprocess.run(
+        [sys.executable, "-m", "verifier.cli",
+         "--report", str(report), "--workbook", str(xlsx)],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+    if proc.returncode != 0:
+        print(f"CLI exited {proc.returncode} (expected 0). stderr tail:", file=sys.stderr)
+        sys.stderr.write(proc.stderr[-2000:])
+        return 1
+
+    try:
+        data = json.loads(proc.stdout)  # stdout must be valid JSON
+    except json.JSONDecodeError as exc:
+        print(f"CLI stdout was not valid JSON: {exc}", file=sys.stderr)
+        return 1
+
+    findings = data.get("findings", [])
 
     passed = 0
     rows = []
     for case in cases:
-        # Find the agent's finding for this claim
         match = next(
             (f for f in findings
              if case["sentence_contains"].lower() in f["sentence"].lower()
@@ -44,10 +57,24 @@ def main() -> int:
     print(f"{'case':<6}{'expected':<{width}}{'got':<{width}}result")
     for r in rows:
         print(f"{r[0]:<6}{r[1]:<{width}}{r[2]:<{width}}{r[3]}")
-
     print(f"\n{passed}/{len(cases)} cases passed")
-    print(f"Agent summary: {result['summary']}")
-    return 0 if passed == len(cases) else 1
+
+    # Regression gates beyond verdict scoring.
+    claim_ids = [f["claim_id"] for f in findings]
+    logged_once = len(claim_ids) == len(set(claim_ids)) == len(cases)
+    verifiable = [f for f in findings if f["verdict"] != "unverifiable"]
+    exact_cells = all(f.get("source_cell") for f in verifiable)
+    schema_ok = data.get("schema_version") == "1.0"
+    completed = data.get("status") == "completed" and data.get("completion", {}).get("complete")
+
+    print(f"schema_version 1.0: {schema_ok}")
+    print(f"all {len(cases)} claims logged exactly once: {logged_once}")
+    print(f"every verifiable finding has an exact source cell: {exact_cells}")
+    print(f"CLI status completed: {completed}")
+
+    gates = (passed == len(cases) and logged_once and exact_cells
+             and schema_ok and completed)
+    return 0 if gates else 1
 
 
 if __name__ == "__main__":

@@ -5,21 +5,17 @@ Requires ANTHROPIC_API_KEY in the environment.
 """
 
 import os
-import uuid
-import tempfile
-from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
 
-from verifier.agent import run_verification, MODEL
+from verifier.engine import verify_report_from_bytes, EngineOptions, EngineError
 from verifier.tools import (
     sanitize,
     resolve_source_sheet,
     sheets_referenced,
     mismatch_line,
 )
-from verifier.ingestion import extract_report_text, IngestionError
 
 st.set_page_config(page_title="FigureAudit", page_icon="✅", layout="wide")
 
@@ -334,57 +330,23 @@ with col2:
 
 use_sample = st.checkbox("Use bundled sample data instead", value=not (report_file and xlsx_file))
 
-
-def _ingestion_meta(result, filename):
-    return {
-        "report_name": filename,
-        "file_type": result.file_type,
-        "page_count": result.page_count,
-        "paragraph_count": result.paragraph_count,
-        "table_count": result.table_count,
-        "warnings": list(result.warnings),
-    }
-
-
 if st.button("Run verification", type="primary"):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.error("Set ANTHROPIC_API_KEY in your environment first.")
         st.stop()
 
-    xlsx_path = None
     if use_sample:
         report_name = "sample_data/draft_report.md"
         xlsx_name = "sample_data/source_data.xlsx"
-        with open(report_name, "rb") as fh:
-            report_bytes = fh.read()
-        try:
-            ingestion = extract_report_text(report_bytes, report_name)
-        except IngestionError as exc:
-            st.error(str(exc))
-            st.stop()
-        report_text = ingestion.extracted_text
-        ingestion_meta = _ingestion_meta(ingestion, report_name)
-        xlsx_path = xlsx_name
+        report_bytes = open(report_name, "rb").read()
+        xlsx_bytes = open(xlsx_name, "rb").read()
     elif report_file and xlsx_file:
-        try:
-            ingestion = extract_report_text(report_file, report_file.name)
-        except IngestionError as exc:
-            st.error(str(exc))
-            st.stop()
-        report_text = ingestion.extracted_text
+        report_bytes = report_file.read()
         report_name = report_file.name
+        xlsx_bytes = xlsx_file.read()
         xlsx_name = xlsx_file.name
-        ingestion_meta = _ingestion_meta(ingestion, report_name)
-        tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-        tmp.write(xlsx_file.read())
-        tmp.close()
-        xlsx_path = tmp.name
     else:
         st.warning("Upload both files or tick the sample-data box.")
-        st.stop()
-
-    if not report_text.strip():
-        st.error("No text could be extracted from this report. Please check the file.")
         st.stop()
 
     status = st.status("Agent working…", expanded=True)
@@ -392,33 +354,49 @@ if st.button("Run verification", type="primary"):
     def progress(tool_name, tool_input):
         status.write(f"`{tool_name}` -> {str(tool_input)[:120]}")
 
-    with st.spinner("Running agent loop"):
-        result = run_verification(report_text, xlsx_path, progress_callback=progress)
+    # Streamlit consumes the same engine interface as the CLI; no separate path.
+    try:
+        with st.spinner("Running agent loop"):
+            run = verify_report_from_bytes(
+                report_bytes, report_name, xlsx_bytes, xlsx_name,
+                EngineOptions(progress=progress),
+            )
+    except EngineError as exc:
+        status.update(label="Verification failed", state="error", expanded=True)
+        st.error(str(exc))
+        st.stop()
 
     status.update(label="Verification complete", state="complete", expanded=False)
 
-    findings = [_clean_finding(f) for f in result.get("findings", [])]
-    summary_text = sanitize(next(
-        (entry["text"] for entry in result.get("transcript", [])
-         if isinstance(entry, dict) and entry.get("role") == "assistant"
-         and "text" in entry),
-        "",
-    ))
+    if run.status != "completed":
+        st.warning(
+            "Verification did not complete cleanly: "
+            + "; ".join(run.completion_issues)
+        )
+
+    findings = [_clean_finding(f) for f in run.findings]
 
     # Persist the completed run once; ordinary reruns (filters, downloads) reuse it
     # so the run ID and timestamp stay stable.
     st.session_state["run"] = {
-        "run_id": uuid.uuid4().hex[:8],
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "model": MODEL,
-        "report_name": report_name,
-        "xlsx_name": xlsx_name,
-        "report_text": report_text,
-        "ingestion": ingestion_meta,
+        "run_id": run.run_id,
+        "timestamp": run.timestamp,
+        "model": run.model,
+        "report_name": run.report_name,
+        "xlsx_name": run.workbook_name,
+        "report_text": run.extracted_text,
+        "ingestion": {
+            "report_name": run.report_name,
+            "file_type": run.report_type,
+            "page_count": run.ingestion["page_count"],
+            "paragraph_count": run.ingestion["paragraph_count"],
+            "table_count": run.ingestion["table_count"],
+            "warnings": run.ingestion["warnings"],
+        },
         "findings": findings,
-        "summary_text": summary_text,
-        "summary_counts": result.get("summary", {}),
-        "transcript": result.get("transcript", []),
+        "summary_text": sanitize(run.summary_text),
+        "summary_counts": run.verdict_counts,
+        "transcript": run.transcript,
     }
 
 # ---- Render the most recent completed run exactly once -----------------------

@@ -168,16 +168,25 @@ TOOL_SCHEMAS = [
 ]
 
 
-def run_verification(report_text: str, spreadsheet_path: str,
-                     progress_callback=None) -> dict:
-    """Run the full agent loop. Returns findings, summary, and the transcript."""
+def run_verification(report_text: str, spreadsheet_path, progress_callback=None,
+                     model: str | None = None, max_turns: int | None = None) -> dict:
+    """Run the full agent loop. Returns findings, summary, transcript, and run stats.
+
+    `spreadsheet_path` may be a path or a file-like object (openpyxl accepts both).
+    This is the grounded core; it does no presentation and holds no UI state.
+    """
+    model = model or MODEL
+    max_turns = max_turns or MAX_TURNS
     client = anthropic.Anthropic()  # ANTHROPIC_API_KEY from env
     workbook = SourceWorkbook(spreadsheet_path)
     log = FindingsLog()
 
     claims = extract_numeric_claims(report_text)
     if not claims:
-        return {"findings": [], "summary": {}, "note": "No numeric claims found."}
+        return {"findings": [], "summary": {}, "claims": [], "claims_extracted": 0,
+                "transcript": [], "tool_calls": 0, "turns": 0,
+                "hit_turn_limit": False, "evidence": {"comparisons": {}},
+                "model": model, "note": "No numeric claims found."}
 
     user_message = (
         "Here are the numeric claims extracted from the report. Verify each "
@@ -186,10 +195,14 @@ def run_verification(report_text: str, spreadsheet_path: str,
     )
     messages = [{"role": "user", "content": user_message}]
     transcript = []
+    tool_calls = 0
+    turns = 0
+    hit_turn_limit = True  # cleared when the model ends its turn normally
 
-    for _ in range(MAX_TURNS):
+    for _ in range(max_turns):
+        turns += 1
         response = client.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=4096,
             system=SYSTEM_PROMPT,
             tools=TOOL_SCHEMAS,
@@ -202,12 +215,14 @@ def run_verification(report_text: str, spreadsheet_path: str,
                 b.text for b in response.content if b.type == "text"
             )
             transcript.append({"role": "assistant", "text": final_text})
+            hit_turn_limit = False
             break
 
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
+            tool_calls += 1
             result = _dispatch(block.name, block.input, workbook, log)
             transcript.append({
                 "tool": block.name,
@@ -226,8 +241,14 @@ def run_verification(report_text: str, spreadsheet_path: str,
     return {
         "findings": log.to_dicts(),
         "summary": log.summary(),
+        "claims": claims,
         "claims_extracted": len(claims),
         "transcript": transcript,
+        "tool_calls": tool_calls,
+        "turns": turns,
+        "hit_turn_limit": hit_turn_limit,
+        "evidence": {"comparisons": workbook.comparison_records()},
+        "model": model,
     }
 
 
@@ -262,7 +283,9 @@ def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
     """
     verdict = args["verdict"]
     source_location = args.get("source_location", "")
-    sheet = source_cell = label_cell = source_value_id = comparison_id = ""
+    sheet = source_cell = label_cell = ""
+    match_id = source_value_id = comparison_id = ""
+    difference = tolerance = None
     source_value = args.get("source_value", "")
 
     if verdict != "unverifiable":
@@ -301,8 +324,12 @@ def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
         sheet = info["sheet"]
         source_cell = info["cell"]
         label_cell = info["label_cell"]
+        match_id = info.get("match_id", "")
         source_value_id = svid
         source_value = str(info["value"])
+        comparison = workbook.resolve_comparison(comparison_id) or {}
+        difference = comparison.get("difference")
+        tolerance = comparison.get("tolerance")
         source_location = with_cell_prefix(source_cell, source_location)
 
     status = resolve_source_sheet(
@@ -320,7 +347,10 @@ def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
         sheet=sheet,
         source_cell=source_cell,
         label_cell=label_cell,
+        match_id=match_id,
         source_value_id=source_value_id,
         comparison_id=comparison_id,
+        difference=difference,
+        tolerance=tolerance,
         source_mapping_status=status,
     )
