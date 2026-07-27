@@ -17,14 +17,17 @@ import anthropic
 from .tools import (
     SourceWorkbook,
     extract_numeric_claims,
-    compare_values,
+    compare_source_value,
+    values_equal,
     FindingsLog,
     with_cell_prefix,
     resolve_source_sheet,
 )
 
 MODEL = os.environ.get("VERIFIER_MODEL", "claude-sonnet-4-6")
-MAX_TURNS = 40
+# The per-claim tool chain (find -> select -> compare -> log) uses more turns
+# than v1.1, so allow generous headroom; the agent batches each step.
+MAX_TURNS = 60
 
 SYSTEM_PROMPT = """You are a meticulous report verification agent. You are given \
 a draft report and access to its source-of-truth spreadsheet via tools.
@@ -33,35 +36,36 @@ Your task: verify every numeric claim in the report against the spreadsheet.
 
 Rules you must follow:
 1. NEVER rely on your own memory or arithmetic. Every source value must come \
-from a spreadsheet tool call, and every comparison must use compare_values.
-2. For each numeric claim, either (a) verify it and log a finding that includes \
-source_match_id (the match_id copied verbatim from the exact find_in_spreadsheet \
-result you used), or (b) log it as 'unverifiable' with a note explaining why \
-(e.g. the figure comes from an external citation, not the source data). For \
-unverifiable claims, set source_location to exactly "Not present in \
-spreadsheet" and leave source_match_id, sheet, and cell empty.
-3. Match the claim to the RIGHT cell, not merely to any cell that happens to \
-hold the same number. When a claim names a period (an explicit year such as \
-"in 2026", or a relative term like "now", "current", or "today"), read the \
-header row to find the matching column and compare against THAT column's \
-value. A relative term with no explicit year refers to the most recent period \
-in the data (the latest column). Double-check that the value you compared \
-truly sits in that cell before logging.
+from the spreadsheet tools, and every comparison must use compare_values.
+2. To verify a spreadsheet-backed claim, follow this exact tool chain:
+   a. find_in_spreadsheet to locate the row. Each match lists every cell in \
+that row with its exact cell reference, value, and column header.
+   b. select_source_cell(match_id, cell) to pick the EXACT numeric value cell \
+the claim refers to (the correct column/period). It returns a source_value_id. \
+Do NOT pick the row-label cell as the source value.
+   c. compare_values(reported_value, source_value_id, tolerance) for the verdict.
+   d. log_finding(...) referencing that same source_value_id.
+3. Match the claim to the RIGHT column. When a claim names a period (an explicit \
+year such as "in 2026", or a relative term like "now", "current", or "today"), \
+select the cell under the matching column header. A relative term with no \
+explicit year refers to the most recent period (the latest column).
 4. source_location is a human-readable explanation only: give the sheet name, \
 row label, and column/period, for example \
-"Sales sheet, row 3 (Manchester GBP k), 2026 column". You need not prepend the \
-cell reference yourself; it is added automatically from source_match_id. Never \
-invent a match_id: copy it verbatim from a find_in_spreadsheet result.
-5. Use tolerance=0.5 by default for percentages that appear rounded to whole \
-numbers; use tolerance=0 for exact counts. State the tolerance you used in \
-the note when it matters.
-6. Do not editorialise about the report's arguments. You verify numbers only.
-7. Never use em dash characters in any text you write (source_location, notes, \
+"Adoption sheet, Firms scaling AI (%), 2026 column". The exact value cell is \
+added automatically from source_value_id; do not prepend it yourself.
+5. For a claim that is not in the spreadsheet (e.g. an external citation), log \
+it as 'unverifiable' with source_location exactly "Not present in spreadsheet" \
+and no source_value_id.
+6. Use tolerance=0.5 by default for percentages that appear rounded to whole \
+numbers; use tolerance=0 for exact counts.
+7. Do not editorialise about the report's arguments. You verify numbers only.
+8. Never use em dash characters in any text you write (source_location, notes, \
 or your final summary). Use a colon, semicolon, comma, or hyphen instead.
-8. When all claims are processed, reply with a short plain-text summary. Do \
+9. When all claims are processed, reply with a short plain-text summary. Do \
 not restate every finding; they are already in the log.
 
-Work through claims systematically. Batch related lookups where possible."""
+Work through claims systematically, and batch the same step across claims where \
+possible (select cells for several claims, then compare them, then log them)."""
 
 TOOL_SCHEMAS = [
     {
@@ -73,13 +77,11 @@ TOOL_SCHEMAS = [
         "name": "find_in_spreadsheet",
         "description": (
             "Search all sheets for cells containing the query text "
-            "(case-insensitive). Each match includes a `match_id` (copy it "
-            "verbatim into log_finding as source_match_id), the `sheet`, the "
-            "exact Excel `cell` reference (A1 notation, sheet-qualified, e.g. "
-            "Sales!D3), the row, the full row context, and the sheet's "
-            "header_row, so you can align each number to the correct "
-            "column/period (e.g. the '2026' column) instead of guessing by "
-            "position."
+            "(case-insensitive). Each match includes a `match_id`, the `sheet`, "
+            "the `label_cell` that matched, and a `cells` list giving every cell "
+            "in that row with its exact `cell` reference, `value`, and column "
+            "`header`. Use select_source_cell to pick the numeric value cell for "
+            "the correct column/period (e.g. the '2026' column)."
         ),
         "input_schema": {
             "type": "object",
@@ -88,21 +90,46 @@ TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "compare_values",
+        "name": "select_source_cell",
         "description": (
-            "Compare a reported figure with a source figure numerically. "
-            "Returns a verdict: match, rounding_diff, mismatch, or "
-            "not_comparable. All comparison arithmetic happens here, never "
-            "compare numbers yourself."
+            "Pick the exact numeric value cell from a find_in_spreadsheet match. "
+            "Pass the match_id and the cell (an A1 reference from that match's "
+            "`cells`, e.g. Adoption!D2). Returns a source_value_id to use in "
+            "compare_values and log_finding. The cell must be one returned for "
+            "that match."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "reported": {"type": "string"},
-                "source": {"type": "string"},
+                "match_id": {"type": "string"},
+                "cell": {
+                    "type": "string",
+                    "description": "A1 cell reference from the match's cells list.",
+                },
+            },
+            "required": ["match_id", "cell"],
+        },
+    },
+    {
+        "name": "compare_values",
+        "description": (
+            "Compare a reported figure against the exact source value chosen "
+            "with select_source_cell. Pass reported_value and source_value_id; "
+            "Python resolves the source number and computes the verdict (match, "
+            "rounding_diff, mismatch, or not_comparable). Never type the source "
+            "number yourself."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reported_value": {"type": "string"},
+                "source_value_id": {
+                    "type": "string",
+                    "description": "id returned by select_source_cell.",
+                },
                 "tolerance": {"type": "number", "default": 0.0},
             },
-            "required": ["reported", "source"],
+            "required": ["reported_value", "source_value_id"],
         },
     },
     {
@@ -110,9 +137,9 @@ TOOL_SCHEMAS = [
         "description": (
             "Record one verified (or unverifiable) claim in the findings log. "
             "Call this exactly once per claim. For spreadsheet-backed findings, "
-            "pass source_match_id (the match_id from the exact find_in_spreadsheet "
-            "result you used); the sheet and cell are resolved from it. Leave "
-            "source_match_id, sheet, and cell empty for unverifiable claims."
+            "pass the source_value_id used in compare_values; the sheet, exact "
+            "value cell, and source value are resolved from it. Leave "
+            "source_value_id empty for unverifiable claims."
         ),
         "input_schema": {
             "type": "object",
@@ -126,12 +153,12 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "enum": ["match", "rounding_diff", "mismatch", "unverifiable"],
                 },
-                "source_match_id": {
+                "source_value_id": {
                     "type": "string",
-                    "description": "match_id copied verbatim from find_in_spreadsheet.",
+                    "description": "id from select_source_cell / compare_values.",
                 },
+                "source_cell": {"type": "string"},
                 "sheet": {"type": "string"},
-                "cell": {"type": "string"},
                 "note": {"type": "string"},
             },
             "required": ["claim_id", "sentence", "reported_value",
@@ -211,9 +238,11 @@ def _dispatch(name: str, args: dict, workbook: SourceWorkbook,
             return {"sheets": workbook.list_sheets()}
         if name == "find_in_spreadsheet":
             return {"matches": workbook.find_value(args["query"])}
+        if name == "select_source_cell":
+            return workbook.select_source_cell(args["match_id"], args["cell"])
         if name == "compare_values":
-            return compare_values(
-                args["reported"], args["source"],
+            return compare_source_value(
+                workbook, args["reported_value"], args["source_value_id"],
                 float(args.get("tolerance", 0.0)),
             )
         if name == "log_finding":
@@ -226,34 +255,55 @@ def _dispatch(name: str, args: dict, workbook: SourceWorkbook,
 def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
     """Resolve source evidence deterministically, then record the finding.
 
-    Sheet and cell come from the tool-issued source_match_id (validated against
-    this run's results), never from model-typed prose. source_location is kept
-    for human explanation only, with the authoritative cell prepended.
+    Sheet, exact value cell, and source value come from the source_value_id that
+    compare_values used (validated against this run's registry), never from
+    model-typed prose. source_location is kept for human explanation only, with
+    the authoritative value cell prepended.
     """
     verdict = args["verdict"]
     source_location = args.get("source_location", "")
-    sheet = cell = ""
+    sheet = source_cell = label_cell = source_value_id = comparison_id = ""
+    source_value = args.get("source_value", "")
 
     if verdict != "unverifiable":
-        match_id = (args.get("source_match_id") or "").strip()
-        if match_id:
-            resolved = workbook.resolve_match(match_id)
-            if resolved is None:
-                return {"error": (
-                    f"Unknown source_match_id '{match_id}'. Copy match_id exactly "
-                    "from a find_in_spreadsheet result returned in this run."
-                )}
-            sheet, cell = resolved["sheet"], resolved["cell"]
-        else:
-            # Fallback: accept a model-supplied cell/sheet only if it was actually
-            # returned by find_in_spreadsheet during this run.
-            m_cell = (args.get("cell") or "").strip()
-            m_sheet = (args.get("sheet") or "").strip()
-            if m_cell and workbook.is_known_cell(m_cell):
-                cell, sheet = m_cell, workbook.sheet_for_cell(m_cell)
-            elif m_sheet and workbook.is_known_sheet(m_sheet):
-                sheet = m_sheet
-        source_location = with_cell_prefix(cell, source_location)
+        svid = (args.get("source_value_id") or "").strip()
+        if not svid:
+            return {"error": (
+                "Spreadsheet-backed findings require source_value_id from "
+                "select_source_cell / compare_values."
+            )}
+        info = workbook.resolve_source_value(svid)
+        if info is None:
+            return {"error": f"Unknown source_value_id '{svid}'."}
+        comparison_id = info.get("comparison_id", "")
+        if not comparison_id:
+            return {"error": (
+                f"source_value_id '{svid}' was not used in compare_values. "
+                "Call compare_values with it first."
+            )}
+        if source_value and not values_equal(source_value, info["value"]):
+            return {"error": (
+                f"Logged source value '{source_value}' does not match the "
+                f"registered spreadsheet value '{info['value']}'."
+            )}
+        m_cell = (args.get("source_cell") or "").strip()
+        if m_cell and m_cell != info["cell"]:
+            return {"error": (
+                f"source_cell '{m_cell}' conflicts with the registered cell "
+                f"'{info['cell']}'."
+            )}
+        m_sheet = (args.get("sheet") or "").strip()
+        if m_sheet and m_sheet != info["sheet"]:
+            return {"error": (
+                f"sheet '{m_sheet}' conflicts with the registered sheet "
+                f"'{info['sheet']}'."
+            )}
+        sheet = info["sheet"]
+        source_cell = info["cell"]
+        label_cell = info["label_cell"]
+        source_value_id = svid
+        source_value = str(info["value"])
+        source_location = with_cell_prefix(source_cell, source_location)
 
     status = resolve_source_sheet(
         {"verdict": verdict, "sheet": sheet, "source_location": source_location}
@@ -263,11 +313,14 @@ def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
         claim_id=args["claim_id"],
         sentence=args["sentence"],
         reported_value=args["reported_value"],
-        source_value=args["source_value"],
+        source_value=source_value,
         source_location=source_location,
         verdict=verdict,
         note=args.get("note", ""),
         sheet=sheet,
-        cell=cell,
+        source_cell=source_cell,
+        label_cell=label_cell,
+        source_value_id=source_value_id,
+        comparison_id=comparison_id,
         source_mapping_status=status,
     )

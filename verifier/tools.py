@@ -45,34 +45,76 @@ class SourceWorkbook:
 
     def __init__(self, path: str):
         self._wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        # Per-run evidence registry so findings can cite a validated result by id
-        # instead of the model re-typing (and sometimes dropping) a cell ref.
+        # Per-run evidence registries. Findings cite tool-issued ids, and the
+        # exact sheet / cell / value are resolved here, never from model prose.
         self._match_counter = 0
-        self._matches: dict[str, dict] = {}   # match_id -> {"sheet", "cell"}
-        self._cell_sheet: dict[str, str] = {}  # cell ref -> sheet name
+        self._matches: dict[str, dict] = {}        # match_id -> row evidence
+        self._srcval_counter = 0
+        self._source_values: dict[str, dict] = {}  # source_value_id -> cell evidence
+        self._comparison_counter = 0
+        self._comparisons: dict[str, dict] = {}    # comparison_id -> comparison record
 
     def list_sheets(self) -> list[str]:
         return self._wb.sheetnames
 
-    def _register_match(self, sheet: str, cell: str) -> str:
+    def _register_match(self, sheet: str, label_cell: str, row_label: str,
+                        cell_list: list) -> str:
         self._match_counter += 1
         match_id = f"match_{self._match_counter:04d}"
-        self._matches[match_id] = {"sheet": sheet, "cell": cell}
-        self._cell_sheet[cell] = sheet
+        self._matches[match_id] = {
+            "sheet": sheet,
+            "label_cell": label_cell,
+            "row_label": row_label,
+            "cells": {c["cell"]: c for c in cell_list},
+        }
         return match_id
 
-    def resolve_match(self, match_id: str):
-        """Return {'sheet','cell'} for a match_id issued this run, else None."""
-        return self._matches.get(match_id)
+    def select_source_cell(self, match_id: str, cell: str) -> dict:
+        """Register the exact value cell chosen from a match; return its evidence.
 
-    def is_known_cell(self, cell: str) -> bool:
-        return cell in self._cell_sheet
+        Rejects a cell that was not part of the named match. The returned
+        source_value_id is what compare_values and log_finding must reference.
+        """
+        match = self._matches.get(match_id)
+        if match is None:
+            return {"error": f"Unknown match_id '{match_id}'. "
+                             "Use a match_id from find_in_spreadsheet."}
+        info = match["cells"].get(cell)
+        if info is None:
+            return {"error": f"Cell '{cell}' was not returned for match_id "
+                             f"'{match_id}'. Choose a cell from that match's cells."}
+        self._srcval_counter += 1
+        source_value_id = f"srcval_{self._srcval_counter:04d}"
+        self._source_values[source_value_id] = {
+            "source_value_id": source_value_id,
+            "sheet": match["sheet"],
+            "cell": cell,
+            "value": info["value"],
+            "header": info["header"],
+            "row_label": match["row_label"],
+            "label_cell": match["label_cell"],
+        }
+        return dict(self._source_values[source_value_id])
 
-    def sheet_for_cell(self, cell: str) -> str:
-        return self._cell_sheet.get(cell, "")
+    def resolve_source_value(self, source_value_id: str):
+        """Return the registered evidence for a source_value_id, else None."""
+        return self._source_values.get(source_value_id)
 
-    def is_known_sheet(self, sheet: str) -> bool:
-        return sheet in set(self._wb.sheetnames)
+    def register_comparison(self, record: dict) -> str:
+        """Record one compare_values call; link it back to its source value."""
+        self._comparison_counter += 1
+        comparison_id = f"cmp_{self._comparison_counter:04d}"
+        record = dict(record)
+        record["comparison_id"] = comparison_id
+        self._comparisons[comparison_id] = record
+        source = self._source_values.get(record.get("source_value_id"))
+        if source is not None:
+            source["comparison_id"] = comparison_id
+        return comparison_id
+
+    def resolve_comparison(self, comparison_id: str):
+        """Return the registered comparison record, else None."""
+        return self._comparisons.get(comparison_id)
 
     def read_sheet(self, sheet_name: str, max_rows: int = 200) -> list[list]:
         """Return the sheet as a list of rows (truncated for context safety)."""
@@ -89,11 +131,11 @@ class SourceWorkbook:
     def find_value(self, query: str) -> list[dict]:
         """Search all sheets for cells whose text matches `query` (case-insensitive).
 
-        Each match carries a `match_id` (a stable, tool-issued identifier for
-        that exact result this run), the `sheet`, the exact Excel `cell`
-        reference (A1 notation, sheet-qualified, e.g. Sales!D3), its row context,
-        and the sheet's header row. Findings cite the `match_id`, so the sheet
-        and cell are resolved deterministically rather than parsed from prose.
+        Each match carries a `match_id`, the `sheet`, the `label_cell` that was
+        matched, and a `cells` list exposing every cell in that row with its
+        exact `cell` reference, `value`, and column `header`. Pick the numeric
+        value cell with select_source_cell; the sheet, cell, and value are then
+        resolved deterministically rather than parsed from prose.
         """
         query_l = query.lower()
         raw = []
@@ -106,20 +148,31 @@ class SourceWorkbook:
                     header_row = cells
                 for c_idx, cell in enumerate(row, start=1):
                     if cell is not None and query_l in str(cell).lower():
-                        raw.append((name, r_idx, c_idx, str(cell), header_row, cells))
+                        raw.append((name, r_idx, c_idx, header_row, cells))
 
         hits = []
-        for name, r_idx, c_idx, cell_value, header_row, cells in raw[:20]:
-            cell_ref = _excel_cell_ref(name, r_idx, c_idx)
+        for name, r_idx, c_idx, header_row, row_cells in raw[:20]:
+            label_ref = _excel_cell_ref(name, r_idx, c_idx)
+            label_value = row_cells[c_idx - 1] if c_idx - 1 < len(row_cells) else ""
+            cell_list = []
+            for j, value in enumerate(row_cells, start=1):
+                header = header_row[j - 1] if header_row and j - 1 < len(header_row) else ""
+                cell_list.append({
+                    "sheet": name,
+                    "cell": _excel_cell_ref(name, r_idx, j),
+                    "row": r_idx,
+                    "column": get_column_letter(j),
+                    "value": value,
+                    "header": header,
+                })
+            match_id = self._register_match(name, label_ref, str(label_value), cell_list)
             hits.append({
-                "match_id": self._register_match(name, cell_ref),
+                "match_id": match_id,
                 "sheet": name,
+                "label_cell": label_ref,
                 "row": r_idx,
-                "col": c_idx,
-                "cell": cell_ref,
-                "cell_value": cell_value,
                 "header_row": header_row,
-                "row_context": cells,
+                "cells": cell_list,
             })
         return hits  # capped to 20 results above
 
@@ -226,6 +279,51 @@ def compare_values(reported, source, tolerance: float = 0.0) -> dict:
     }
 
 
+def values_equal(a, b) -> bool:
+    """Numeric equality when both parse as numbers, else exact string match."""
+    fa, fb = _to_float(a), _to_float(b)
+    if fa is not None and fb is not None:
+        return abs(fa - fb) < 1e-9
+    return str(a).strip() == str(b).strip()
+
+
+def compare_source_value(workbook, reported_value, source_value_id, tolerance=0.0) -> dict:
+    """Compare a reported figure against a registered source cell's value.
+
+    The source number is resolved from source_value_id inside Python; the model
+    never supplies or retypes it. The result carries the exact source cell,
+    sheet, row label, and column header alongside the verdict.
+    """
+    info = workbook.resolve_source_value(source_value_id)
+    if info is None:
+        return {"error": f"Unknown source_value_id '{source_value_id}'. "
+                         "Call select_source_cell first."}
+    result = compare_values(reported_value, info["value"], tolerance)
+    comparison_id = workbook.register_comparison({
+        "source_value_id": source_value_id,
+        "reported_value": reported_value,
+        "tolerance": tolerance,
+        "verdict": result["verdict"],
+        "source_value": info["value"],
+        "source_cell": info["cell"],
+        "sheet": info["sheet"],
+        "label_cell": info["label_cell"],
+        "row_label": info["row_label"],
+        "column_header": info["header"],
+        "difference": result.get("abs_diff"),
+    })
+    result.update({
+        "comparison_id": comparison_id,
+        "source_value": info["value"],
+        "source_cell": info["cell"],
+        "sheet": info["sheet"],
+        "row_label": info["row_label"],
+        "column_header": info["header"],
+        "difference": result.get("abs_diff"),
+    })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Source evidence and display helpers (deterministic, no free-text parsing
 # during normal operation)
@@ -329,8 +427,11 @@ class Finding:
     source_location: str
     verdict: str          # match | rounding_diff | mismatch | unverifiable
     note: str = ""
-    sheet: str = ""       # resolved worksheet name (empty for unverifiable)
-    cell: str = ""        # resolved A1 cell reference (empty for unverifiable)
+    sheet: str = ""         # resolved worksheet name (empty for unverifiable)
+    source_cell: str = ""   # exact numeric value cell, e.g. Adoption!D2
+    label_cell: str = ""    # row-label cell used to find the row, e.g. Adoption!A2
+    source_value_id: str = ""  # evidence chain: select_source_cell id (empty if unverifiable)
+    comparison_id: str = ""    # evidence chain: compare_values id (empty if unverifiable)
     source_mapping_status: str = ""  # structured | fallback | under_specified | n/a
 
 
