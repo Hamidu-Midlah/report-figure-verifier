@@ -182,10 +182,19 @@ class SourceWorkbook:
 # ---------------------------------------------------------------------------
 
 # Matches e.g. "39%", "39.5 %", "USD 4.2 billion", "4,200", "0.7pp"
+# Known issue (deferred to a later numeric-normalisation change): the unit
+# alternation matches "m" before "million" (and "k"/"bn" similarly), so
+# "95 million" is captured as the figure "95 m". This is format-agnostic and left
+# unchanged here on purpose; fix it when unit normalisation is added.
 _NUMBER_PATTERN = re.compile(
     r"(?P<num>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?P<unit>%|pp|percentage points?|bn|billion|m|million|k|thousand)?",
     re.IGNORECASE,
 )
+
+# Ingestion inserts "[Page N]" boundaries into PDF text for the reviewer preview.
+# They are page markers, not figures, so they are ignored before claim scanning
+# (the page number must never be mistaken for a numeric claim).
+_PAGE_MARKER = re.compile(r"\[\s*page\s+\d+\s*\]", re.IGNORECASE)
 
 
 def _looks_like_year(num: str, unit: str | None) -> bool:
@@ -214,6 +223,8 @@ def extract_numeric_claims(report_text: str) -> list[dict]:
     """
     claims = []
     claim_id = 0
+    # Drop page-boundary markers so a page number never becomes a numeric claim.
+    report_text = _PAGE_MARKER.sub(" ", report_text)
     # Paragraphs are separated by blank lines; unwrap hard line breaks inside one.
     for paragraph in re.split(r"\n\s*\n", report_text):
         paragraph = re.sub(r"\s+", " ", paragraph.replace("\n", " ")).strip()

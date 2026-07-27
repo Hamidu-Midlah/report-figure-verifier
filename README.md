@@ -22,6 +22,44 @@ streamlit run app.py          # tick "use bundled sample data"
 The bundled sample report contains three seeded errors and one deliberately
 unverifiable external claim. The agent finds all of them.
 
+## Report formats
+
+FigureAudit ingests reports in four formats; the spreadsheet must be `.xlsx`.
+
+| Format | Support |
+| --- | --- |
+| `.md`, `.txt` | UTF-8 text, paragraph boundaries preserved |
+| `.docx` | Paragraphs, headings, list text, and table cells, in document order |
+| `.pdf` | Text-based PDFs only, extracted page by page |
+
+Ingestion only converts a report to text; claim extraction, comparison, and the
+evidence chain are identical for every format. The exact text passed to
+verification is shown in the "Report under review" expander, labelled "Extracted
+report text used for verification", alongside a per-file summary (type, pages,
+paragraphs, tables, and any warnings), so a reviewer can catch extraction
+problems before trusting the findings.
+
+**DOCX scope.** Normal paragraphs, headings, list paragraphs, and table text are
+extracted in document order; table cells are separated with ` | ` and each row
+is kept distinct. Not read: images, text boxes and floating shapes, and (unless
+separately added and tested) tracked changes, comments, headers, footers, and
+footnotes. FigureAudit does not claim complete DOCX fidelity.
+
+**Text-based PDF limitation.** PDF text is extracted with pdfplumber, page by
+page, with a `[Page N]` boundary inserted into the preview (page markers are
+never treated as numeric claims). Reading order and tables may not perfectly
+reproduce the visual document. Blank or image-only pages are noted as warnings
+and skipped without rejecting the rest of the document. A PDF with no extractable
+text is reported as scanned or image-based and refused. Encrypted or malformed
+PDFs produce a clear error.
+
+**No OCR.** Scanned or image-only PDFs are not supported and are not read by any
+optical process.
+
+Limits (sized for Streamlit Community Cloud): 10 MB per uploaded file, 300 PDF
+pages, and 2,000,000 extracted characters. Uploaded reports are processed in
+memory and not persisted beyond the active run.
+
 ## Architecture
 
 ```

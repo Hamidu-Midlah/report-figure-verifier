@@ -19,6 +19,7 @@ from verifier.tools import (
     sheets_referenced,
     mismatch_line,
 )
+from verifier.ingestion import extract_report_text, IngestionError
 
 st.set_page_config(page_title="FigureAudit", page_icon="✅", layout="wide")
 
@@ -243,7 +244,21 @@ def render_results(run_state: dict) -> None:
 
     # ---- What was checked ------------------------------------------------
     with st.expander("Report under review"):
-        st.markdown(run_state["report_text"])
+        ingestion = run_state.get("ingestion", {})
+        bits = [f"File: {ingestion.get('report_name', run_state['report_name'])}"]
+        if ingestion.get("file_type"):
+            bits.append(f"Type: {ingestion['file_type']}")
+        if ingestion.get("page_count") is not None:
+            bits.append(f"Pages: {ingestion['page_count']}")
+        if ingestion.get("paragraph_count") is not None:
+            bits.append(f"Paragraphs: {ingestion['paragraph_count']}")
+        if ingestion.get("table_count") is not None:
+            bits.append(f"Tables: {ingestion['table_count']}")
+        st.markdown("  ·  ".join(bits))
+        for warning in ingestion.get("warnings", []):
+            st.warning(warning)
+        st.caption("Extracted report text used for verification")
+        st.text(run_state["report_text"])
 
     # ---- Findings table + filter -----------------------------------------
     st.subheader("Findings (human review required)")
@@ -310,32 +325,66 @@ def render_results(run_state: dict) -> None:
 
 col1, col2 = st.columns(2)
 with col1:
-    report_file = st.file_uploader("Draft report (.md / .txt)", type=["md", "txt"])
+    report_file = st.file_uploader(
+        "Draft report (.md / .txt / .docx / .pdf)",
+        type=["md", "txt", "docx", "pdf"],
+    )
 with col2:
     xlsx_file = st.file_uploader("Source spreadsheet (.xlsx)", type=["xlsx"])
 
 use_sample = st.checkbox("Use bundled sample data instead", value=not (report_file and xlsx_file))
+
+
+def _ingestion_meta(result, filename):
+    return {
+        "report_name": filename,
+        "file_type": result.file_type,
+        "page_count": result.page_count,
+        "paragraph_count": result.paragraph_count,
+        "table_count": result.table_count,
+        "warnings": list(result.warnings),
+    }
+
 
 if st.button("Run verification", type="primary"):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.error("Set ANTHROPIC_API_KEY in your environment first.")
         st.stop()
 
+    xlsx_path = None
     if use_sample:
         report_name = "sample_data/draft_report.md"
         xlsx_name = "sample_data/source_data.xlsx"
-        report_text = open(report_name).read()
+        with open(report_name, "rb") as fh:
+            report_bytes = fh.read()
+        try:
+            ingestion = extract_report_text(report_bytes, report_name)
+        except IngestionError as exc:
+            st.error(str(exc))
+            st.stop()
+        report_text = ingestion.extracted_text
+        ingestion_meta = _ingestion_meta(ingestion, report_name)
         xlsx_path = xlsx_name
     elif report_file and xlsx_file:
-        report_text = report_file.read().decode("utf-8")
+        try:
+            ingestion = extract_report_text(report_file, report_file.name)
+        except IngestionError as exc:
+            st.error(str(exc))
+            st.stop()
+        report_text = ingestion.extracted_text
+        report_name = report_file.name
+        xlsx_name = xlsx_file.name
+        ingestion_meta = _ingestion_meta(ingestion, report_name)
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         tmp.write(xlsx_file.read())
         tmp.close()
         xlsx_path = tmp.name
-        report_name = report_file.name
-        xlsx_name = xlsx_file.name
     else:
         st.warning("Upload both files or tick the sample-data box.")
+        st.stop()
+
+    if not report_text.strip():
+        st.error("No text could be extracted from this report. Please check the file.")
         st.stop()
 
     status = st.status("Agent working…", expanded=True)
@@ -365,6 +414,7 @@ if st.button("Run verification", type="primary"):
         "report_name": report_name,
         "xlsx_name": xlsx_name,
         "report_text": report_text,
+        "ingestion": ingestion_meta,
         "findings": findings,
         "summary_text": summary_text,
         "summary_counts": result.get("summary", {}),
