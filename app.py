@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from verifier.engine import verify_report_from_bytes, EngineOptions, EngineError
+from verifier.classify import exclusion_counts
 from verifier.tools import (
     sanitize,
     resolve_source_sheet,
@@ -133,7 +134,7 @@ def _run_info_lines(run: dict) -> list:
     """Ordered run-metadata lines shared by the expander and the reports."""
     findings = run["findings"]
     sheets = sheets_referenced(findings)
-    return [
+    lines = [
         f"- Run ID: {run['run_id']}",
         f"- Timestamp: {run['timestamp']}",
         f"- Model: {run['model']}",
@@ -144,6 +145,17 @@ def _run_info_lines(run: dict) -> list:
         f"- Claims checked: {len(findings)}",
         f"- Source sheets referenced: {len(sheets)}",
     ]
+    acc = run.get("accounting")
+    if acc:
+        lines += [
+            f"- Numeric candidates extracted: {acc['candidates_extracted']}",
+            f"- Accepted claims: {acc['accepted_count']}",
+            f"- Excluded candidates by category: {acc['excluded_counts']}",
+            f"- Batches: {acc['batch_count']}",
+        ]
+        if acc.get("failed_batches"):
+            lines.append(f"- Failed batches: {', '.join(acc['failed_batches'])}")
+    return lines
 
 
 def build_markdown_report(body_findings, run: dict) -> str:
@@ -237,6 +249,16 @@ def render_results(run_state: dict) -> None:
     # ---- Run information -------------------------------------------------
     with st.expander("Run information"):
         st.markdown("\n".join(_run_info_lines(run_state)))
+        acc = run_state.get("accounting")
+        if acc and acc.get("batches"):
+            st.caption("Per-batch accounting")
+            st.dataframe(
+                pd.DataFrame(acc["batches"])[
+                    ["batch_id", "claim_count", "finding_count", "complete",
+                     "turns", "error"]
+                ],
+                use_container_width=True, hide_index=True,
+            )
 
     # ---- What was checked ------------------------------------------------
     with st.expander("Report under review"):
@@ -351,12 +373,12 @@ if st.button("Run verification", type="primary"):
 
     status = st.status("Agent working…", expanded=True)
 
-    def progress(tool_name, tool_input):
-        status.write(f"`{tool_name}` -> {str(tool_input)[:120]}")
+    def progress(message):
+        status.write(message)
 
     # Streamlit consumes the same engine interface as the CLI; no separate path.
     try:
-        with st.spinner("Running agent loop"):
+        with st.spinner("Classifying candidates and verifying claims in batches"):
             run = verify_report_from_bytes(
                 report_bytes, report_name, xlsx_bytes, xlsx_name,
                 EngineOptions(progress=progress),
@@ -366,18 +388,26 @@ if st.button("Run verification", type="primary"):
         st.error(str(exc))
         st.stop()
 
-    status.update(label="Verification complete", state="complete", expanded=False)
-
-    if run.status != "completed":
+    failed_batches = [b for b in run.batches if b.get("error")]
+    if run.status == "failed":
+        status.update(label="Verification failed", state="error", expanded=True)
+        st.error(
+            f"Verification failed ({run.error_kind}). "
+            + "; ".join(run.errors or run.completion_issues)
+        )
+    elif run.status != "completed":
+        status.update(label="Verification incomplete", state="error", expanded=False)
         st.warning(
             "Verification did not complete cleanly: "
             + "; ".join(run.completion_issues)
         )
+    else:
+        status.update(label="Verification complete", state="complete", expanded=False)
 
     findings = [_clean_finding(f) for f in run.findings]
 
-    # Persist the completed run once; ordinary reruns (filters, downloads) reuse it
-    # so the run ID and timestamp stay stable.
+    # Persist the run once; ordinary reruns (filters, downloads) reuse it so the
+    # run id and timestamp stay stable.
     st.session_state["run"] = {
         "run_id": run.run_id,
         "timestamp": run.timestamp,
@@ -385,6 +415,7 @@ if st.button("Run verification", type="primary"):
         "report_name": run.report_name,
         "xlsx_name": run.workbook_name,
         "report_text": run.extracted_text,
+        "run_status": run.status,
         "ingestion": {
             "report_name": run.report_name,
             "file_type": run.report_type,
@@ -393,10 +424,21 @@ if st.button("Run verification", type="primary"):
             "table_count": run.ingestion["table_count"],
             "warnings": run.ingestion["warnings"],
         },
+        "accounting": {
+            "candidates_extracted": run.candidates_extracted,
+            "accepted_count": run.accepted_count,
+            "excluded_counts": exclusion_counts(run.excluded),
+            "batch_count": len(run.batches),
+            "failed_batches": [b["batch_id"] for b in failed_batches],
+            "batches": run.batches,
+        },
         "findings": findings,
         "summary_text": sanitize(run.summary_text),
         "summary_counts": run.verdict_counts,
-        "transcript": run.transcript,
+        "transcript": [
+            {"batch_id": g["batch_id"], "entries": g["entries"]}
+            for g in run.transcript_groups
+        ],
     }
 
 # ---- Render the most recent completed run exactly once -----------------------

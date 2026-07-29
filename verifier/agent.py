@@ -168,29 +168,26 @@ TOOL_SCHEMAS = [
 ]
 
 
-def run_verification(report_text: str, spreadsheet_path, progress_callback=None,
-                     model: str | None = None, max_turns: int | None = None) -> dict:
-    """Run the full agent loop. Returns findings, summary, transcript, and run stats.
+def verify_claims_batch(claims, workbook: SourceWorkbook, model: str | None = None,
+                        max_turns: int | None = None, batch_id: str = "",
+                        progress_callback=None) -> dict:
+    """Verify one bounded batch of preclassified claims against a shared workbook.
 
-    `spreadsheet_path` may be a path or a file-like object (openpyxl accepts both).
-    This is the grounded core; it does no presentation and holds no UI state.
+    The engine owns claim selection and batching; this primitive verifies ONLY
+    the claims it is given and never re-extracts from the full report. Each batch
+    gets a fresh conversation and transcript, and MAX_TURNS applies per batch.
+    The workbook (and its evidence registries) is shared across batches; ids are
+    batch-prefixed. Returns this batch's findings, transcript, and stats.
     """
     model = model or MODEL
     max_turns = max_turns or MAX_TURNS
     client = anthropic.Anthropic()  # ANTHROPIC_API_KEY from env
-    workbook = SourceWorkbook(spreadsheet_path)
     log = FindingsLog()
 
-    claims = extract_numeric_claims(report_text)
-    if not claims:
-        return {"findings": [], "summary": {}, "claims": [], "claims_extracted": 0,
-                "transcript": [], "tool_calls": 0, "turns": 0,
-                "hit_turn_limit": False, "evidence": {"comparisons": {}},
-                "model": model, "note": "No numeric claims found."}
-
     user_message = (
-        "Here are the numeric claims extracted from the report. Verify each "
-        "against the source spreadsheet using your tools.\n\n"
+        "Verify each of the following preclassified numeric claims against the "
+        "source spreadsheet using your tools. Verify only these claims; do not "
+        "look for additional claims.\n\n"
         f"{json.dumps(claims, indent=2)}"
     )
     messages = [{"role": "user", "content": user_message}]
@@ -239,16 +236,13 @@ def run_verification(report_text: str, spreadsheet_path, progress_callback=None,
         messages.append({"role": "user", "content": tool_results})
 
     return {
+        "batch_id": batch_id,
         "findings": log.to_dicts(),
         "summary": log.summary(),
-        "claims": claims,
-        "claims_extracted": len(claims),
         "transcript": transcript,
         "tool_calls": tool_calls,
         "turns": turns,
         "hit_turn_limit": hit_turn_limit,
-        "evidence": {"comparisons": workbook.comparison_records()},
-        "model": model,
     }
 
 
@@ -344,6 +338,7 @@ def _apply_log_finding(args: dict, workbook: SourceWorkbook, log: FindingsLog):
         source_location=source_location,
         verdict=verdict,
         note=args.get("note", ""),
+        batch_id=workbook._batch_id,
         sheet=sheet,
         source_cell=source_cell,
         label_cell=label_cell,

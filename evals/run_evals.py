@@ -64,10 +64,10 @@ def main() -> int:
     logged_once = len(claim_ids) == len(set(claim_ids)) == len(cases)
     verifiable = [f for f in findings if f["verdict"] != "unverifiable"]
     exact_cells = all(f.get("source_cell") for f in verifiable)
-    schema_ok = data.get("schema_version") == "1.0"
+    schema_ok = data.get("schema_version") == "1.1"
     completed = data.get("status") == "completed" and data.get("completion", {}).get("complete")
 
-    print(f"schema_version 1.0: {schema_ok}")
+    print(f"schema_version 1.1: {schema_ok}")
     print(f"all {len(cases)} claims logged exactly once: {logged_once}")
     print(f"every verifiable finding has an exact source cell: {exact_cells}")
     print(f"CLI status completed: {completed}")

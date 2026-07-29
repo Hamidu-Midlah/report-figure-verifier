@@ -45,14 +45,55 @@ class SourceWorkbook:
 
     def __init__(self, path: str):
         self._wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        # Per-run evidence registries. Findings cite tool-issued ids, and the
-        # exact sheet / cell / value are resolved here, never from model prose.
+        # Run-level evidence registries, shared across batches. Findings cite
+        # tool-issued ids, and the exact sheet / cell / value are resolved here,
+        # never from model prose. Ids are batch-prefixed for global uniqueness.
         self._match_counter = 0
         self._matches: dict[str, dict] = {}        # match_id -> row evidence
         self._srcval_counter = 0
         self._source_values: dict[str, dict] = {}  # source_value_id -> cell evidence
         self._comparison_counter = 0
         self._comparisons: dict[str, dict] = {}    # comparison_id -> comparison record
+        self._batch_id = ""
+        self._batch_prefix = ""
+
+    def set_batch(self, batch_id: str) -> None:
+        """Begin a batch: prefix new evidence ids with it and reset per-batch counters.
+
+        The registries persist across batches (one index for the whole run), so a
+        prefix such as ``b02_`` keeps ids globally unique: b01_match_0001,
+        b02_match_0001, and so on.
+        """
+        self._batch_id = batch_id
+        self._batch_prefix = f"{batch_id}_" if batch_id else ""
+        self._match_counter = 0
+        self._srcval_counter = 0
+        self._comparison_counter = 0
+
+    def evidence_index(self) -> dict:
+        """The run-level evidence index, keyed by globally unique evidence id."""
+        source_values = {}
+        for svid, rec in self._source_values.items():
+            source_values[svid] = {
+                "batch_id": svid.split("_")[0] if "_" in svid else "",
+                "match_id": rec.get("match_id"),
+                "comparison_id": rec.get("comparison_id"),
+                "sheet": rec.get("sheet"),
+                "cell": rec.get("cell"),
+                "value": rec.get("value"),
+            }
+        return {
+            "match_ids": sorted(self._matches),
+            "source_values": source_values,
+            "comparison_ids": sorted(self._comparisons),
+        }
+
+    def close(self) -> None:
+        """Release the underlying workbook handle (read-only mode keeps it open)."""
+        try:
+            self._wb.close()
+        except Exception:  # noqa: BLE001 - closing must never raise
+            pass
 
     def list_sheets(self) -> list[str]:
         return self._wb.sheetnames
@@ -60,7 +101,7 @@ class SourceWorkbook:
     def _register_match(self, sheet: str, label_cell: str, row_label: str,
                         cell_list: list) -> str:
         self._match_counter += 1
-        match_id = f"match_{self._match_counter:04d}"
+        match_id = f"{self._batch_prefix}match_{self._match_counter:04d}"
         self._matches[match_id] = {
             "sheet": sheet,
             "label_cell": label_cell,
@@ -84,7 +125,7 @@ class SourceWorkbook:
             return {"error": f"Cell '{cell}' was not returned for match_id "
                              f"'{match_id}'. Choose a cell from that match's cells."}
         self._srcval_counter += 1
-        source_value_id = f"srcval_{self._srcval_counter:04d}"
+        source_value_id = f"{self._batch_prefix}srcval_{self._srcval_counter:04d}"
         self._source_values[source_value_id] = {
             "source_value_id": source_value_id,
             "match_id": match_id,
@@ -97,6 +138,10 @@ class SourceWorkbook:
         }
         return dict(self._source_values[source_value_id])
 
+    def resolve_match(self, match_id: str):
+        """Return the registered row evidence for a match_id, else None."""
+        return self._matches.get(match_id)
+
     def resolve_source_value(self, source_value_id: str):
         """Return the registered evidence for a source_value_id, else None."""
         return self._source_values.get(source_value_id)
@@ -104,7 +149,7 @@ class SourceWorkbook:
     def register_comparison(self, record: dict) -> str:
         """Record one compare_values call; link it back to its source value."""
         self._comparison_counter += 1
-        comparison_id = f"cmp_{self._comparison_counter:04d}"
+        comparison_id = f"{self._batch_prefix}cmp_{self._comparison_counter:04d}"
         record = dict(record)
         record["comparison_id"] = comparison_id
         self._comparisons[comparison_id] = record
@@ -241,8 +286,10 @@ def extract_numeric_claims(report_text: str) -> list[dict]:
                 continue
             for m in _NUMBER_PATTERN.finditer(sent):
                 num, unit = m.group("num"), m.group("unit")
-                if num is None or _looks_like_year(num, unit):
+                if num is None:
                     continue
+                # Years are surfaced as candidates and excluded by the classifier,
+                # so nothing is silently dropped before classification.
                 claim_id += 1
                 claims.append({
                     "claim_id": f"C{claim_id:03d}",
@@ -443,6 +490,7 @@ class Finding:
     source_location: str
     verdict: str          # match | rounding_diff | mismatch | unverifiable
     note: str = ""
+    batch_id: str = ""      # batch that produced this finding
     sheet: str = ""         # resolved worksheet name (empty for unverifiable)
     source_cell: str = ""   # exact numeric value cell, e.g. Adoption!D2
     label_cell: str = ""    # row-label cell used to find the row, e.g. Adoption!A2

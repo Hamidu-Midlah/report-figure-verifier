@@ -95,7 +95,7 @@ def _figures(text):
     return {c["figure"] for c in extract_numeric_claims(text)}
 
 
-EQUIV_TEXT = "In 2026, adoption reached 30% and satisfaction improved to 12%."
+EQUIV_TEXT = "Adoption reached 30% and satisfaction improved to 12%."
 EQUIV_FIGURES = {"30%", "12%"}
 
 
@@ -128,7 +128,7 @@ def test_txt_invalid_utf8_is_rejected():
 # ---------------------------------------------------------------------------
 
 def test_docx_paragraphs():
-    data = _docx_paragraphs(["In 2026, adoption reached 30%.",
+    data = _docx_paragraphs(["Adoption reached 30%.",
                              "Satisfaction improved to 12%."])
     res = extract_report_text(data, "report.docx")
     assert res.file_type == "docx"
@@ -138,7 +138,7 @@ def test_docx_paragraphs():
 
 def test_docx_table_claims_distinguishable():
     data = _docx_with_table(
-        rows=[["City", "2026 sales"], ["Manchester", "95k"], ["Leeds", "99k"]],
+        rows=[["City", "Sales"], ["Manchester", "95k"], ["Leeds", "99k"]],
         paragraphs=["Regional sales table follows."],
     )
     res = extract_report_text(data, "report.docx")
@@ -234,7 +234,7 @@ def test_unsupported_file_type_is_rejected():
 def test_preview_text_is_the_extraction_input():
     # The text shown in the preview is exactly the text fed to claim extraction:
     # one field, used verbatim by app.py for both preview and run_verification.
-    data = _make_pdf(["Growth hit 30% in 2026.", "", "It fell to 24% later."])
+    data = _make_pdf(["Growth hit 30% this period.", "", "It fell to 24% later."])
     res = extract_report_text(data, "report.pdf")
     supplied = res.extracted_text
     assert "[Page 1]" in supplied and "[Page 2]" in supplied

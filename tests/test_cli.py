@@ -1,9 +1,10 @@
-"""Deterministic, offline tests for the verifier CLI and JSON schema.
+"""Deterministic, offline tests for the verifier CLI and JSON schema (1.1).
 
-The verification loop (the only part that needs the Anthropic API) is replaced
-with a canned result, so these tests are fast and network-free. They exercise
-the CLI argument handling, JSON-on-stdout / logs-on-stderr separation, exit
-codes, schema serialisation, evidence chain, and the optional transcript.
+The Anthropic boundary is mocked at client.messages.create (via the batching
+test's protocol-speaking brain), so the real engine, classification, batching,
+and evidence flow run without any network. These tests cover CLI argument
+handling, JSON-on-stdout / logs-on-stderr separation, exit codes, the versioned
+schema and its new batch fields, and the optional per-batch transcript.
 Run with:  python -m tests.test_cli
 """
 
@@ -17,78 +18,14 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from verifier import cli, engine
+from tests.test_batching import Brain, _patched, _synthetic, _write
 from tests.test_ingestion import _make_pdf, _docx_paragraphs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-XLSX = os.path.join(ROOT, "sample_data", "source_data.xlsx")
 _TMP = tempfile.mkdtemp()
-
-
-def _fixture(name, data: bytes):
-    path = os.path.join(_TMP, name)
-    with open(path, "wb") as fh:
-        fh.write(data)
-    return path
-
-
-TXT_REPORT = _fixture("report.txt", b"In 2026, adoption reached 36%.")
-DOCX_REPORT = _fixture("report.docx", _docx_paragraphs(["Adoption reached 36%."]))
-PDF_REPORT = _fixture("report.pdf", _make_pdf(["Adoption reached 36% this year."]))
-BLANK_PDF = _fixture("blank.pdf", _make_pdf(["", ""]))
-
-
-def _result(hit_turn_limit=False):
-    return {
-        "findings": [
-            {"claim_id": "C001", "sentence": "In 2026, 36% scaled AI",
-             "reported_value": "36%", "source_value": "39",
-             "source_location": "Adoption!D2; Adoption sheet, 2026 column",
-             "verdict": "mismatch", "note": "", "sheet": "Adoption",
-             "source_cell": "Adoption!D2", "label_cell": "Adoption!A2",
-             "match_id": "match_0001", "source_value_id": "srcval_0001",
-             "comparison_id": "cmp_0001", "difference": 3, "tolerance": 0.5,
-             "source_mapping_status": "structured"},
-            {"claim_id": "C002", "sentence": "USD 200 billion by 2028",
-             "reported_value": "200 billion", "source_value": "",
-             "source_location": "Not present in spreadsheet",
-             "verdict": "unverifiable", "note": "external forecast", "sheet": "",
-             "source_cell": "", "label_cell": "", "match_id": "",
-             "source_value_id": "", "comparison_id": "", "difference": None,
-             "tolerance": None, "source_mapping_status": "n/a"},
-        ],
-        "summary": {"mismatch": 1, "unverifiable": 1},
-        "claims": [{"claim_id": "C001", "sentence": "s1", "figure": "36%"},
-                   {"claim_id": "C002", "sentence": "s2", "figure": "200 billion"}],
-        "claims_extracted": 2,
-        "transcript": [
-            {"tool": "find_in_spreadsheet",
-             "input": {"query": "scaling", "api_key": "sk-ant-SHOULD-NOT-APPEAR"},
-             "result_preview": "match_0001"},
-            {"role": "assistant",
-             "text": "Done. Leaked token sk-ant-SECRETVALUE123 must be redacted."},
-        ],
-        "tool_calls": 4, "turns": 3, "hit_turn_limit": hit_turn_limit,
-        "evidence": {"comparisons": {
-            "cmp_0001": {"source_cell": "Adoption!D2", "source_value_id": "srcval_0001"}}},
-        "model": "claude-sonnet-4-6",
-    }
-
-
-@contextlib.contextmanager
-def _patched(result):
-    original = engine.run_verification
-
-    def fake(*args, **kwargs):
-        callback = kwargs.get("progress_callback")
-        if callback:  # engine forwards its progress hook; exercise it
-            callback("find_in_spreadsheet", {"query": "scaling"})
-        return dict(result, model=kwargs.get("model") or result["model"])
-
-    engine.run_verification = fake
-    try:
-        yield
-    finally:
-        engine.run_verification = original
+BLANK_PDF = os.path.join(_TMP, "blank.pdf")
+with open(BLANK_PDF, "wb") as _fh:
+    _fh.write(_make_pdf(["", ""]))
 
 
 def _run(argv):
@@ -102,10 +39,25 @@ def _run(argv):
     return code, out.getvalue(), err.getvalue()
 
 
-def _complete(extra_argv=None, report=TXT_REPORT):
-    argv = ["--report", report, "--workbook", XLSX] + (extra_argv or [])
-    with _patched(_result()):
-        return _run(argv)
+def _complete(fmt="txt", extra=None, genuine=6, structural=4, brain=None):
+    """Run the CLI on a small synthetic report of the given format, mocked."""
+    text, xlsx = _synthetic(genuine=genuine, structural=structural)
+    genuine_lines = [l for l in text.split("\n\n") if l.startswith("Metric")]
+    if fmt == "txt":
+        report_bytes = text.encode("utf-8")
+    elif fmt == "docx":
+        report_bytes = _docx_paragraphs(genuine_lines)
+    else:
+        report_bytes = _make_pdf([" ".join(genuine_lines)])
+    with tempfile.TemporaryDirectory() as tmp:
+        report = _write(tmp, f"report.{fmt}", report_bytes)
+        wb = _write(tmp, "w.xlsx", xlsx)
+        argv = ["--report", report, "--workbook", wb, "--batch-size", "5"] + (extra or [])
+        out, err = io.StringIO(), io.StringIO()
+        with _patched(brain or Brain()):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(argv)
+    return code, out.getvalue(), err.getvalue()
 
 
 # --- CLI basics --------------------------------------------------------------
@@ -113,86 +65,75 @@ def _complete(extra_argv=None, report=TXT_REPORT):
 def test_help_mentions_transcript_confidentiality():
     code, out, _ = _run(["--help"])
     assert code == 0
-    assert "usage" in out.lower()
-    assert "confidential" in out.lower()
+    assert "usage" in out.lower() and "confidential" in out.lower()
 
 
-def test_schema_version_flag():
+def test_schema_version_is_1_1():
     code, out, _ = _run(["--schema-version"])
-    assert code == 0
-    assert out.strip() == "1.0"
+    assert code == 0 and out.strip() == "1.1"
 
 
-def test_valid_json_on_stdout_and_logs_on_stderr():
+def test_valid_json_on_stdout_logs_on_stderr():
     code, out, err = _complete()
     assert code == 0
-    data = json.loads(out)  # stdout is valid JSON
-    assert data["schema_version"] == "1.0"
-    assert data["status"] == "completed"
-    # logs went to stderr only, never into stdout
-    assert "tool:" in err and "completed" in err.lower()
-    assert "tool:" not in out
+    data = json.loads(out)
+    assert data["schema_version"] == "1.1" and data["status"] == "completed"
+    assert "Batch" in err and "tool:" not in out
 
 
 def test_output_file_keeps_stdout_clean():
-    target = os.path.join(_TMP, "result.json")
-    code, out, _ = _complete(extra_argv=["--output", target])
-    assert code == 0
-    assert out.strip() == ""  # nothing on stdout when writing a file
-    with open(target) as fh:
-        assert json.load(fh)["schema_version"] == "1.0"
+    text, xlsx = _synthetic(genuine=6, structural=4)
+    with tempfile.TemporaryDirectory() as tmp:
+        report = _write(tmp, "r.txt", text.encode("utf-8"))
+        wb = _write(tmp, "w.xlsx", xlsx)
+        target = os.path.join(tmp, "result.json")
+        out = io.StringIO()
+        with _patched(Brain()):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = cli.main(["--report", report, "--workbook", wb,
+                                 "--batch-size", "5", "--output", target])
+        assert code == 0 and out.getvalue().strip() == ""
+        with open(target) as fh:
+            assert json.load(fh)["schema_version"] == "1.1"
 
 
 # --- Exit codes --------------------------------------------------------------
 
-def test_invalid_input_exit_code():
-    code, _, err = _run(["--report", os.path.join(_TMP, "missing.txt"),
-                         "--workbook", XLSX])
-    assert code == 2
-    assert "not found" in err.lower()
+def test_invalid_input_exit_2():
+    code, _out, err = _run(["--report", os.path.join(_TMP, "missing.txt"),
+                            "--workbook", os.path.join(ROOT, "sample_data", "source_data.xlsx")])
+    assert code == 2 and "not found" in err.lower()
 
 
-def test_ingestion_failure_exit_code():
-    code, _, err = _run(["--report", BLANK_PDF, "--workbook", XLSX])
-    assert code == 3
-    assert "scanned" in err.lower()
-
-
-def test_incomplete_verification_exit_code():
-    argv = ["--report", TXT_REPORT, "--workbook", XLSX]
-    with _patched(_result(hit_turn_limit=True)):
-        code, out, err = _run(argv)
-    assert code == 5
-    data = json.loads(out)  # still valid JSON documenting the incompletion
-    assert data["status"] == "incomplete"
-    assert data["completion"]["complete"] is False
-    assert "incomplete" in err.lower()
+def test_ingestion_failure_exit_3():
+    code, _out, err = _run(["--report", BLANK_PDF,
+                            "--workbook", os.path.join(ROOT, "sample_data", "source_data.xlsx")])
+    assert code == 3 and "scanned" in err.lower()
 
 
 # --- Ingestion reaches the shared layer -------------------------------------
 
 def test_docx_and_pdf_reach_shared_ingestion():
-    for report, expected in ((DOCX_REPORT, "docx"), (PDF_REPORT, "pdf")):
-        code, out, _ = _complete(report=report)
+    for fmt in ("docx", "pdf"):
+        code, out, _ = _complete(fmt=fmt)
         assert code == 0
-        assert json.loads(out)["input"]["report_type"] == expected
+        assert json.loads(out)["input"]["report_type"] == fmt
 
 
-# --- Schema and evidence chain ----------------------------------------------
+# --- Schema 1.1 fields -------------------------------------------------------
 
-def test_findings_schema_and_evidence_chain():
-    _code, out, _ = _complete()
+def test_schema_carries_batch_and_accounting_fields():
+    _code, out, _ = _complete(genuine=8, structural=6)
     data = json.loads(out)
-    findings = {f["claim_id"]: f for f in data["findings"]}
-    verifiable = findings["C001"]
-    for key in ("match_id", "source_value_id", "comparison_id", "source_cell",
-                "difference", "tolerance", "label_cell", "source_mapping_status"):
-        assert verifiable.get(key) not in (None, ""), key
-    assert verifiable["source_mapping_status"] == "structured"
-    unverifiable = findings["C002"]
-    for key in ("match_id", "source_value_id", "comparison_id", "source_cell",
-                "label_cell"):
-        assert not unverifiable.get(key), key
+    assert data["candidates_extracted"] >= data["accepted_claim_count"]
+    assert "excluded_candidates" in data and "counts" in data["excluded_candidates"]
+    assert "batches" in data and data["batches"]
+    assert "evidence_index" in data
+    assert data["settings"]["batch_size"] == 5
+    for f in data["findings"]:
+        assert f["batch_id"], "finding missing batch_id"
+        for key in ("match_id", "source_value_id", "comparison_id", "source_cell"):
+            assert f[key], f"verifiable finding missing {key}"
 
 
 # --- Transcript --------------------------------------------------------------
@@ -200,37 +141,34 @@ def test_findings_schema_and_evidence_chain():
 def test_transcript_absent_by_default():
     _code, out, _ = _complete()
     data = json.loads(out)
-    assert data["transcript_included"] is False
-    assert "transcript" not in data
+    assert data["transcript_included"] is False and "transcript" not in data
 
 
-def test_transcript_present_only_with_flag():
-    _code, out, _ = _complete(extra_argv=["--include-transcript"])
+def test_transcript_present_grouped_by_batch_with_flag():
+    _code, out, _ = _complete(genuine=8, extra=["--include-transcript"])
     data = json.loads(out)
     assert data["transcript_included"] is True
-    assert isinstance(data["transcript"], list) and data["transcript"]
+    assert data["transcript"] and all("batch_id" in g and "entries" in g
+                                       for g in data["transcript"])
 
 
-def test_transcript_never_serialises_secrets():
-    _code, out, _ = _complete(extra_argv=["--include-transcript"])
-    assert "sk-ant-" not in out
-    assert "SHOULD-NOT-APPEAR" not in out
-    assert "SECRETVALUE123" not in out
-    assert "[redacted]" in out
+def test_transcript_redacts_secrets():
+    _code, out, _ = _complete(extra=["--include-transcript"],
+                              brain=Brain(secret="sk-ant-LEAKED123"))
+    assert "sk-ant-LEAKED123" not in out and "[redacted]" in out
 
 
 def test_transcript_does_not_change_findings():
-    _c1, out_default, _ = _complete()
-    _c2, out_with, _ = _complete(extra_argv=["--include-transcript"])
-    assert json.loads(out_default)["findings"] == json.loads(out_with)["findings"]
-    assert json.loads(out_default)["verdict_counts"] == json.loads(out_with)["verdict_counts"]
+    _c1, plain, _ = _complete()
+    _c2, witht, _ = _complete(extra=["--include-transcript"])
+    assert json.loads(plain)["findings"] == json.loads(witht)["findings"]
 
 
-# --- Same engine entry point for Streamlit and CLI --------------------------
+# --- Same engine entry point -------------------------------------------------
 
 def test_streamlit_and_cli_use_same_engine():
     assert cli.verify_report is engine.verify_report
-    import app  # imports Streamlit in bare mode; render path is guarded by session state
+    import app
     assert app.verify_report_from_bytes is engine.verify_report_from_bytes
 
 

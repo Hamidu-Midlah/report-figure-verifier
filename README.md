@@ -127,10 +127,29 @@ structured, validated reference can be used.
 ## Engine and CLI
 
 The verification engine is independent of Streamlit. One public entry point owns
-report ingestion, numeric-claim extraction, spreadsheet loading, tool
-orchestration, exact source-cell selection, Python comparisons, evidence-chain
-validation, completeness checking, structured findings, and run metadata. It
-holds no UI state and does no presentation.
+report ingestion, deterministic claim relevance classification, numeric-claim
+extraction, bounded batch verification, spreadsheet loading, tool orchestration,
+exact source-cell selection, Python comparisons, evidence-chain and completeness
+validation, structured findings, and run metadata. It holds no UI state and does
+no presentation.
+
+Every numeric candidate is first classified by deterministic Python rules into
+`accepted` (a genuine quantitative claim), `structural` (page numbers, contents
+dot leaders, section and figure numbers, identifiers, bibliography numbering),
+`definitional` (a scale or range definition), or `contextual` (a date or period
+that only scopes a claim). Classification is conservative: anything not
+confidently structural, definitional, or contextual is accepted. Only accepted
+claims are verified; every excluded candidate is retained in the JSON with its
+category and reason, so nothing is silently dropped.
+
+Accepted claims are verified in deterministic batches (`--batch-size`, default
+around 20). Each batch runs a fresh model conversation containing only its own
+claims, while one shared workbook and evidence index serve the whole run.
+Tool-issued evidence ids are batch-prefixed (`b01_match_0001`, `b02_srcval_0001`)
+so they are globally unique, and the merged run validates the full chain per
+finding: `batch_id` to `match_id` to `source_value_id` to `comparison_id` to the
+exact source cell. The per-call model payload therefore stays bounded by batch
+size and does not grow with the document's total candidate count.
 
 From Python:
 
@@ -158,9 +177,10 @@ From the command line:
 python -m verifier.cli \
   --report report.docx \
   --workbook source.xlsx \
+  --batch-size 20 \           # accepted claims per batch (default around 20)
   --output result.json        # omit --output to write JSON to stdout
 
-python -m verifier.cli --schema-version   # prints 1.0
+python -m verifier.cli --schema-version   # prints 1.1
 python -m verifier.cli --help
 ```
 
@@ -184,28 +204,41 @@ Exit codes:
 | 1 | Internal failure |
 | 2 | Invalid input or usage |
 | 3 | Ingestion failure |
-| 4 | Authentication failure |
+| 4 | Anthropic authentication failure |
 | 5 | Incomplete or truncated verification |
+| 6 | Other Anthropic upstream failure (rate limit, oversized request, server error) |
 
-The process exits `0` only when every extracted claim is logged exactly once,
+The process exits `0` only when every accepted claim is logged exactly once,
 every verifiable finding carries its full evidence chain
-(`match_id` to `source_value_id` to `comparison_id` to finding) with the compared
-cell matching the selected source cell, and the run did not reach its turn limit.
+(`batch_id` to `match_id` to `source_value_id` to `comparison_id` to finding)
+from its own batch with the compared cell matching the selected source cell, and
+no batch reached its turn limit. On exit 4, 5, and 6 the JSON is still emitted
+with all findings from completed batches, accurate per-batch status, and the
+failure reason, so completed evidence is never discarded.
 
-### JSON schema (version 1.0)
+### JSON schema (version 1.1)
 
-Top level: `schema_version`, `run_id`, `status`, `timestamp`, `model`, `input`,
-`ingestion`, `settings`, `extracted_claim_count`, `completed_finding_count`,
-`verdict_counts`, `source_sheets_referenced`, `findings`, `completion`, `errors`,
-`tool_call_count`, `agent_turn_count`, `transcript_included` (and `transcript`
-only when requested).
+Version 1.1 is additive over 1.0; no existing field was removed or renamed.
 
-Each verifiable finding carries `claim_id`, `sentence`, `reported_value`,
-`source_value`, `verdict`, `difference`, `tolerance`, `sheet`, `label_cell`,
-`source_cell`, `match_id`, `source_value_id`, `comparison_id`, `source_location`,
-`source_mapping_status`, and `note`. Unverifiable findings carry no spreadsheet
-evidence identifiers. Secrets and API keys are never present in the default
-output.
+Top level: `schema_version`, `run_id`, `status` (`completed` / `incomplete` /
+`failed`), `error_kind`, `timestamp`, `model`, `input`, `ingestion`, `settings`
+(now including `batch_size`), `candidates_extracted`, `accepted_claim_count`,
+`extracted_claim_count` (retained; equals the accepted count),
+`completed_finding_count`, `excluded_candidates` (`counts` by category and the
+retained `items` with `category` and `reason`), `verdict_counts`,
+`source_sheets_referenced`, `batches` (per-batch `batch_id`, `claim_count`,
+`finding_count`, `complete`, `turns`, `error`), `evidence_index` (keyed by
+globally unique evidence id), `findings`, `completion`, `errors`,
+`tool_call_count`, `agent_turn_count`, `transcript_included` (and `transcript`,
+grouped by batch, only when requested).
+
+Each finding additionally carries `batch_id`. A verifiable finding carries
+`claim_id`, `sentence`, `reported_value`, `source_value`, `verdict`,
+`difference`, `tolerance`, `sheet`, `label_cell`, `source_cell`, `match_id`,
+`source_value_id`, `comparison_id`, `source_location`, `source_mapping_status`,
+and `note`. Unverifiable findings carry no spreadsheet evidence identifiers.
+Secrets and API keys are never present in the default output, and the optional
+transcript is redacted before serialisation.
 
 ## Architecture boundary and future frontend
 
