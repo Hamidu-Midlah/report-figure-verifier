@@ -350,6 +350,8 @@ with col1:
 with col2:
     xlsx_file = st.file_uploader("Source spreadsheet (.xlsx)", type=["xlsx"])
 
+st.caption("Drag and drop files onto the boxes, or click Upload")
+
 use_sample = st.checkbox("Use bundled sample data instead", value=not (report_file and xlsx_file))
 
 if st.button("Run verification", type="primary"):
